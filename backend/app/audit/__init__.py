@@ -36,6 +36,7 @@ A_CONFIG_CHANGE = "config_change"    # LLM/DB 配置 新增/修改/删除
 A_USER_ACTION = "user_action"        # 注册/登录/改密/注销/角色变更
 A_SESSION_ACTION = "session_action"  # 会话删除/重命名/清空
 A_FILE_UPLOAD = "file_upload"        # 上传文件
+A_HITL_CONFIRMATION = "hitl_confirmation"  # 高风险分析确认/拒绝
 
 
 def _connect() -> sqlite3.Connection:

@@ -26,7 +26,7 @@ from app import persistence
 _lock = threading.RLock()
 
 # 节流参数
-MEMORY_SIGNAL_WORDS = ("常用", "喜欢", "偏好", "每次", "总是", "以后", "记得", "我希望", "我想要", "不要用", "统一用")
+MEMORY_SIGNAL_WORDS = ("常用", "喜欢", "偏好", "默认", "习惯", "每次", "总是", "以后", "记得", "我希望", "我想要", "不要用", "统一用")
 _EXTRACT_MIN_INTERVAL = 600      # 同一会话两次记忆提取的最小间隔（秒）
 _SUMMARY_EVERY_TURNS = 5         # 每 N 轮（human 消息）更新一次摘要
 _MAX_KEYWORDS = 4                # 检索关键词上限
@@ -50,6 +50,19 @@ CREATE TABLE IF NOT EXISTS session_summaries (
     turn          INTEGER NOT NULL DEFAULT 0,   -- 生成摘要时的 human 轮数
     updated_at    TEXT DEFAULT (datetime('now','localtime'))
 );
+CREATE TABLE IF NOT EXISTS analysis_records (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL,
+    session_id     TEXT NOT NULL,
+    question       TEXT NOT NULL,
+    plan_json      TEXT NOT NULL,
+    evidence_json  TEXT NOT NULL DEFAULT '[]',
+    result_summary TEXT NOT NULL,
+    created_at     TEXT DEFAULT (datetime('now','localtime')),
+    updated_at     TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_records_user_time
+    ON analysis_records(user_id, created_at DESC);
 """
 
 # 会话级提取节流（内存态，重启丢失可接受）
@@ -115,7 +128,7 @@ def _upsert_memory(user_id: int, username: Optional[str], key: str, value: str,
             cur = conn.execute(
                 "INSERT INTO user_memories(user_id, username, key, value, source_session) "
                 "VALUES (?,?,?,?,?) ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, "
-                "updated_at=datetime('now','localtime')",
+                "source_session=excluded.source_session, updated_at=datetime('now','localtime')",
                 (user_id, username, key, value, session_id))
             conn.commit()
             return cur.rowcount > 0
@@ -128,7 +141,8 @@ def get_user_memories(user_id: int) -> list[dict]:
         conn = _connect()
         try:
             return [dict(r) for r in conn.execute(
-                "SELECT key, value, updated_at FROM user_memories WHERE user_id=? ORDER BY updated_at DESC",
+                "SELECT key, value, source_session, created_at, updated_at "
+                "FROM user_memories WHERE user_id=? ORDER BY updated_at DESC",
                 (user_id,))]
         finally:
             conn.close()
@@ -189,12 +203,19 @@ def generate_summary(llm, session_id: str, history_messages: list) -> Optional[s
 
 
 def get_summary(session_id: str) -> Optional[str]:
+    info = get_summary_info(session_id)
+    return info["summary"] if info else None
+
+
+def get_summary_info(session_id: str) -> Optional[dict]:
+    """返回摘要及更新时间；保留 get_summary 字符串接口兼容旧调用方。"""
     with _lock:
         conn = _connect()
         try:
             row = conn.execute(
-                "SELECT summary FROM session_summaries WHERE session_id=?", (session_id,)).fetchone()
-            return row["summary"] if row else None
+                "SELECT summary, turn, updated_at FROM session_summaries WHERE session_id=?",
+                (session_id,)).fetchone()
+            return dict(row) if row else None
         finally:
             conn.close()
 
@@ -221,12 +242,131 @@ def retrieve_relevant(session_id: str, query: str, limit: int = _RETRIEVE_LIMIT)
             conds = " OR ".join(["content LIKE ?"] * len(words))
             params = [session_id] + [f"%{w}%" for w in words]
             rows = conn.execute(
-                f"SELECT role, content FROM messages WHERE session_id=? AND ({conds}) "
-                f"AND role IN ('user','assistant') ORDER BY seq DESC LIMIT ?",
+                f"SELECT m.role, m.content, m.session_id, s.updated_at FROM messages m "
+                f"JOIN sessions s ON s.id=m.session_id WHERE m.session_id=? AND ({conds}) "
+                f"AND m.role IN ('user','assistant') ORDER BY m.seq DESC LIMIT ?",
                 tuple(params + [limit])).fetchall()
             return [dict(r) for r in rows]
         except sqlite3.OperationalError:
             return []  # messages 表不存在（新库）→ 无相关历史
+        finally:
+            conn.close()
+
+
+def _analysis_keywords(query: str) -> list[str]:
+    """为相似分析补充短前缀，命中“统计订单数/统计订单数量”等近似问题。"""
+    terms: list[str] = []
+    for word in _keywords(query):
+        if word not in terms:
+            terms.append(word)
+        if len(word) > 4 and word[:4] not in terms:
+            terms.append(word[:4])
+    return terms[:6]
+
+
+def _plan_memory_payload(plan) -> dict:
+    """只保存可复用的计划意图，不把完整证据/大输出写入长期记忆。"""
+    data = plan.model_dump(exclude_none=True) if hasattr(plan, "model_dump") else dict(plan or {})
+    keep = ("goal", "data_sources", "metrics", "dimensions", "filters", "time_range",
+            "grain", "sort", "unit", "output_format", "assumptions", "steps")
+    payload = {key: data[key] for key in keep if key in data}
+    payload["steps"] = [
+        {key: step[key] for key in ("id", "title", "kind", "depends_on") if key in step}
+        for step in payload.get("steps", [])
+        if isinstance(step, dict)
+    ]
+    return payload
+
+
+def save_analysis_record(user_id: int, session_id: str, question: str, plan,
+                         evidence: list[dict], result_summary: str) -> bool:
+    """保存可复用的分析计划和结果摘要；失败不影响主对话流程。"""
+    question = (question or "").strip()
+    result_summary = (result_summary or "").strip()
+    if not question or not result_summary:
+        return False
+    try:
+        plan_data = _plan_memory_payload(plan)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if not plan_data.get("metrics") and not evidence and not any(
+        step.get("kind") in {"query", "calculate", "validate"}
+        for step in plan_data.get("steps", [])
+    ):
+        return False
+    try:
+        evidence_data = [
+            {key: item.get(key) for key in ("source", "sql", "columns", "row_count", "quality_issues", "created_at")
+             if key in item}
+            for item in (evidence or [])
+        ]
+    except (AttributeError, TypeError):
+        return False
+    with _lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                "INSERT INTO analysis_records(user_id, session_id, question, plan_json, evidence_json, result_summary) "
+                "VALUES (?,?,?,?,?,?)",
+                (user_id, session_id, question[:1000],
+                 json.dumps(plan_data, ensure_ascii=False)[:12000],
+                 json.dumps(evidence_data, ensure_ascii=False)[:12000],
+                 result_summary[:3000]),
+            )
+            conn.commit()
+            return True
+        except sqlite3.Error:
+            return False
+        finally:
+            conn.close()
+
+
+def retrieve_relevant_analysis(user_id: int, query: str, limit: int = 3) -> list[dict]:
+    """按用户隔离检索相似分析，返回计划、证据摘要和结论。"""
+    words = _analysis_keywords(query)
+    if not words:
+        return []
+    limit = max(1, min(int(limit), 10))
+    with _lock:
+        conn = _connect()
+        try:
+            conds = []
+            params = [user_id]
+            for word in words:
+                conds.append("(question LIKE ? OR plan_json LIKE ? OR result_summary LIKE ?)")
+                like = f"%{word}%"
+                params.extend([like, like, like])
+            rows = conn.execute(
+                "SELECT session_id, question, plan_json, evidence_json, result_summary, created_at, updated_at "
+                "FROM analysis_records WHERE user_id=? AND (" + " OR ".join(conds) + ") "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                tuple(params + [limit]),
+            ).fetchall()
+            results = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["plan"] = json.loads(item.pop("plan_json") or "{}")
+                    item["evidence"] = json.loads(item.pop("evidence_json") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                results.append(item)
+            return results
+        finally:
+            conn.close()
+
+
+def delete_analysis_records(session_id: str, user_id: int) -> int:
+    """删除会话时同步清理分析记忆，避免删除会话后残留可检索内容。"""
+    with _lock:
+        conn = _connect()
+        try:
+            cur = conn.execute(
+                "DELETE FROM analysis_records WHERE session_id=? AND user_id=?",
+                (session_id, user_id),
+            )
+            conn.commit()
+            return cur.rowcount
         finally:
             conn.close()
 
@@ -237,13 +377,41 @@ def build_memory_context(user_id: int, session_id: str, query: str) -> Optional[
     parts = []
     mems = get_user_memories(user_id)
     if mems:
-        lines = "\n".join(f"- {m['key']}：{m['value']}" for m in mems[:10])
+        lines = "\n".join(
+            f"- {m['key']}：{m['value']}（来源会话：{m.get('source_session') or '未知'}；"
+            f"更新时间：{m.get('updated_at') or '未知'}）"
+            for m in mems[:10]
+        )
         parts.append(f"【长期记忆（用户偏好/约定）】\n{lines}")
-    summary = get_summary(session_id)
-    if summary:
-        parts.append(f"【本会话历史摘要】\n{summary}")
+    summary_info = get_summary_info(session_id)
+    if summary_info:
+        parts.append(
+            f"【本会话历史摘要｜来源会话：{session_id}；更新时间：{summary_info.get('updated_at') or '未知'}】\n"
+            f"{summary_info['summary']}"
+        )
     hits = retrieve_relevant(session_id, query)
     if hits:
-        lines = "\n".join(f"[{h['role']}] {str(h['content'])[:200]}" for h in hits)
+        lines = "\n".join(
+            f"[{h['role']}] {str(h['content'])[:200]}（来源会话：{h.get('session_id') or session_id}；"
+            f"时间：{h.get('updated_at') or '未知'}）"
+            for h in hits
+        )
         parts.append(f"【与当前问题相关的历史对话】\n{lines}")
+    analyses = retrieve_relevant_analysis(user_id, query)
+    if analyses:
+        lines = []
+        for item in analyses:
+            plan = json.dumps(item.get("plan") or {}, ensure_ascii=False, separators=(",", ":"))
+            lines.append(
+                f"- 问题：{item['question']}（来源会话：{item['session_id']}；"
+                f"时间：{item.get('created_at') or '未知'}）\n"
+                f"  可复用计划：{plan[:1200]}\n"
+                f"  历史结果摘要：{item['result_summary'][:600]}"
+            )
+        parts.append(
+            "【相似历史分析（仅作候选参考，必须用当前数据重新验证）】\n" +
+            "\n".join(lines)
+        )
+    if parts:
+        parts.append("记忆使用规则：当前问题、当前数据、当前口径和当前查询结果优先；历史记忆可能过期，不得直接当作本轮证据。")
     return "\n\n".join(parts) if parts else None

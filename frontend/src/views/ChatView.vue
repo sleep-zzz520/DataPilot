@@ -122,7 +122,7 @@
         </div>
             
         <div v-for="(m, i) in messages" :key="i" class="msg-wrapper" :class="m.role"
-             v-show="!(m.role === 'assistant' && !m.text && !m.error && !(m.visuals || []).length && !(m.tables || []).length)">
+             v-show="!(m.role === 'assistant' && !m.text && !m.error && !m.confirmation && !(m.visuals || []).length && !(m.tables || []).length)">
           <div class="msg">
             <!-- AI头像 - 左侧32px圆形 -->
             <div v-if="m.role === 'assistant'" class="avatar avatar-assistant">
@@ -137,6 +137,28 @@
 
                 <!-- AI 回复：Markdown 渲染为美观格式 -->
                 <MarkdownContent v-if="m.role === 'assistant' && m.text" :content="m.text" />
+                <div v-if="m.role === 'assistant' && m.confirmation" class="hitl-card">
+                  <div class="hitl-title">执行前确认</div>
+                  <div v-if="m.confirmation.reason_labels?.length" class="hitl-row">
+                    <span class="hitl-label">触发原因</span>{{ m.confirmation.reason_labels.join('；') }}
+                  </div>
+                  <div class="hitl-row">
+                    <span class="hitl-label">预计成本</span>{{ m.confirmation.estimated_cost?.model_calls }}，{{ m.confirmation.estimated_cost?.token_range }}
+                  </div>
+                  <div class="hitl-row">
+                    <span class="hitl-label">数据范围</span>{{ (m.confirmation.data_scope || []).join('；') }}
+                  </div>
+                  <div class="hitl-row">
+                    <span class="hitl-label">执行步骤</span>{{ (m.confirmation.steps || []).join(' → ') }}
+                  </div>
+                  <div v-if="m.confirmation.risks?.length" class="hitl-risk">风险：{{ m.confirmation.risks.join('；') }}</div>
+                  <div v-if="m.confirmation.mode === 'clarification'" class="hitl-hint">{{ m.confirmation.prompt }}</div>
+                  <div v-else-if="m.confirmation.status === 'pending'" class="hitl-actions">
+                    <button class="hitl-approve" :disabled="loading" @click="decideConfirmation(m, 'approve')">确认执行</button>
+                    <button class="hitl-reject" :disabled="loading" @click="decideConfirmation(m, 'reject')">拒绝</button>
+                  </div>
+                  <div v-else class="hitl-hint">本次分析已拒绝，未执行查询。</div>
+                </div>
                 <details v-if="m.role === 'assistant' && m.plan" class="analysis-plan">
                   <summary>分析计划</summary>
                   <div class="plan-goal">{{ m.plan.goal }}</div>
@@ -406,6 +428,62 @@ function removeFile(file_id) {
   files.value = files.value.filter(f => f.file_id !== file_id)
 }
 
+function applyDone(target, res) {
+  target.plan = res.plan || target.plan || null
+  target.trace = res.trace || target.trace || []
+  target.sql = res.sql || null
+  target.tables = res.tables || (res.table ? [res.table] : [])
+  target.visuals = (res.visuals || (res.chart ? [{ chart: res.chart }] : []))
+    .map(v => ({ chart: parseChartConfig(v.chart), image: v.image || null }))
+  target.confirmation = res.confirmation || null
+  if (res.confirmation) {
+    target.text = res.reply || target.text || '执行前需要你的确认。'
+    return
+  }
+  if (target.text && target.text.includes('<!--IMAGE_BASE64:')) {
+    target.text = target.text.replace(/<!--IMAGE_BASE64:.*?-->/g, '').trim()
+  }
+  if (!target.text.trim()) target.text = res.reply || '(无文本回复)'
+}
+
+async function decideConfirmation(msg, decision) {
+  const approvalId = msg.confirmation?.approval_id
+  if (!approvalId || loading.value || !store.ready) return
+  const sidAtSend = store.sessionId
+  loading.value = true
+  sendingSessionId.value = sidAtSend
+  streamingActive.value = false
+  msg.text = ''
+  let streamError = false
+  try {
+    await chatApi.streamChat(
+      {
+        message: msg._approvalText,
+        session_id: sidAtSend,
+        llm_config_id: store.currentLlmId,
+        db_config_id: store.currentDbId,
+        file_ids: msg._approvalFileIds || [],
+        approval_id: approvalId,
+        approval_decision: decision
+      },
+      {
+        onDelta: (t) => { if (store.sessionId === sidAtSend) { streamingActive.value = true; msg.text += t } },
+        onTrace: (entries) => { msg.trace = (msg.trace || []).concat(entries) },
+        onPlan: (plan) => { msg.plan = plan },
+        onDone: (res) => { applyDone(msg, res) },
+        onError: (err) => { streamError = true; msg.error = err }
+      }
+    )
+    if (!streamError && !msg.confirmation && store.sessionId === sidAtSend) {
+      pendingMsgs.value.delete(sidAtSend)
+      await loadSession(sidAtSend, true)
+    }
+    await refreshSessions()
+  } catch (err) { msg.error = err } finally {
+    loading.value = false; streamingActive.value = false; sendingSessionId.value = null; scroll()
+  }
+}
+
 async function send() {
   const text = input.value.trim()
   if (!text || loading.value) return
@@ -434,6 +512,7 @@ async function send() {
   pendingMsgs.value.set(store.sessionId, pending)
   streamingActive.value = false
   let streamError = false
+  let awaitingConfirmation = false
   try {
     await chatApi.streamChat(
       {
@@ -470,18 +549,12 @@ async function send() {
           if (store.sessionId !== sidAtSend) return  // 已切换会话：不显示，消息已落库
           const msg = messages.value.find(m => m._key === assistantMsg._key)
           if (!msg) return
-          msg.plan = res.plan || msg.plan || null
-          msg.trace = res.trace || msg.trace || []
-          msg.sql = res.sql || null
-          // 一轮可能有多张图表/表格（visuals/tables 数组），兼容旧字段
-          msg.tables = res.tables || (res.table ? [res.table] : [])
-          msg.visuals = (res.visuals || (res.chart ? [{ chart: res.chart }] : []))
-            .map(v => ({ chart: parseChartConfig(v.chart), image: v.image || null }))
-          // 清理回复文本中可能残留的 base64 标记
-          if (msg.text && msg.text.includes('<!--IMAGE_BASE64:')) {
-            msg.text = msg.text.replace(/<!--IMAGE_BASE64:.*?-->/g, '').trim()
+          if (res.confirmation) {
+            awaitingConfirmation = true
+            msg._approvalText = text
+            msg._approvalFileIds = files.value.map((f) => f.file_id)
           }
-          if (!msg.text.trim()) msg.text = res.reply || '(无文本回复)'
+          applyDone(msg, res)
         },
         onError: (err) => {
           streamError = true
@@ -494,8 +567,8 @@ async function send() {
     )
     // 后端在 done 前已完成持久化；重新加载一次当前会话，确保大响应、
     // 代理截断或 SSE done 丢失时，最终消息也能立即进入当前视图。
-    pendingMsgs.value.delete(sidAtSend)
-    if (!streamError && store.sessionId === sidAtSend) {
+    if (!awaitingConfirmation) pendingMsgs.value.delete(sidAtSend)
+    if (!streamError && !awaitingConfirmation && store.sessionId === sidAtSend) {
       await loadSession(sidAtSend, true)
     }
     // 发送成功后刷新会话列表(标题/时间可能更新)
@@ -904,6 +977,17 @@ function autoResize() {
 .plan-status-failed { color: #DC2626; }
 .plan-warning { margin-top: 7px; color: #B45309; }
 .plan-evidence { margin-top: 5px; color: var(--text-tertiary); }
+.hitl-card { margin-top: 10px; padding: 12px; border: 1px solid #E7C98B; border-radius: 10px; background: #FFFBEB; color: #5B4636; font-size: 13px; line-height: 1.6; }
+.hitl-title { font-weight: 700; margin-bottom: 6px; color: #92400E; }
+.hitl-row { margin-top: 3px; }
+.hitl-label { display: inline-block; min-width: 62px; color: #92400E; font-weight: 600; }
+.hitl-risk { margin-top: 6px; color: #B45309; }
+.hitl-hint { margin-top: 8px; color: #78350F; }
+.hitl-actions { display: flex; gap: 8px; margin-top: 10px; }
+.hitl-actions button { border: 0; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+.hitl-approve { background: #166534; color: #fff; }
+.hitl-reject { background: #FEE2E2; color: #991B1B; }
+.hitl-actions button:disabled { opacity: .55; cursor: not-allowed; }
 
 /* ── Text Content ── */
 .text {

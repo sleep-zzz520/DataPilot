@@ -86,6 +86,19 @@ def _conn() -> sqlite3.Connection:
             password_hash TEXT NOT NULL,
             created_at    TEXT DEFAULT (datetime('now','localtime'))
         );
+        CREATE TABLE IF NOT EXISTS pending_approvals (
+            id            TEXT PRIMARY KEY,
+            user_id       INTEGER NOT NULL,
+            session_id    TEXT NOT NULL,
+            request_hash  TEXT NOT NULL,
+            payload       TEXT NOT NULL,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            created_at    TEXT DEFAULT (datetime('now','localtime')),
+            expires_at    TEXT NOT NULL,
+            decided_at    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_approval_owner
+            ON pending_approvals(user_id, session_id, status);
     """)
     # 迁移：旧库为 sessions/uploads 补充 user_id 列（多租户隔离）
     for table in ("sessions", "uploads"):
@@ -358,6 +371,56 @@ def rename_session(session_id: str, title: str, user_id: Optional[int] = None) -
             )
             conn.commit()
             return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def save_pending_approval(approval_id: str, user_id: int, session_id: str,
+                          request_hash: str, payload: dict, ttl_seconds: int = 900) -> None:
+    """保存一次性确认请求；payload 只保存计划和展示所需元数据，不保存密钥。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute(
+                "INSERT INTO pending_approvals "
+                "(id, user_id, session_id, request_hash, payload, expires_at) "
+                "VALUES (?,?,?,?,?,datetime('now', ?))",
+                (approval_id, user_id, session_id, request_hash,
+                 json.dumps(payload, ensure_ascii=False), f"+{int(ttl_seconds)} seconds"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def consume_pending_approval(approval_id: str, user_id: int, session_id: str,
+                             request_hash: str, decision: str) -> dict:
+    """原子消费确认请求，返回 approved/rejected/invalid，防重放和跨用户使用。"""
+    if decision not in ("approve", "reject"):
+        return {"status": "invalid", "reason": "不支持的确认操作"}
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT request_hash, payload FROM pending_approvals "
+                "WHERE id=? AND user_id=? AND session_id=? AND status='pending' "
+                "AND expires_at > datetime('now')",
+                (approval_id, user_id, session_id),
+            ).fetchone()
+            if row is None:
+                return {"status": "invalid", "reason": "确认请求不存在、已过期或已处理"}
+            if row["request_hash"] != request_hash:
+                return {"status": "invalid", "reason": "确认请求与原始分析不匹配"}
+            status = "approved" if decision == "approve" else "rejected"
+            cur = conn.execute(
+                "UPDATE pending_approvals SET status=?, decided_at=datetime('now') "
+                "WHERE id=? AND status='pending'",
+                (status, approval_id),
+            )
+            if cur.rowcount != 1:
+                return {"status": "invalid", "reason": "确认请求已被处理"}
+            conn.commit()
+            return {"status": status, "payload": json.loads(row["payload"])}
         finally:
             conn.close()
 

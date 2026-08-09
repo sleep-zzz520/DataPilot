@@ -8,8 +8,9 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 
 from app.memory.agent_memory import (
     extract_and_store_memories, get_user_memories,
-    summary_due, generate_summary, get_summary,
-    retrieve_relevant, _keywords, build_memory_context,
+    summary_due, generate_summary, get_summary, get_summary_info,
+    retrieve_relevant, retrieve_relevant_analysis, save_analysis_record,
+    delete_analysis_records, _keywords, build_memory_context,
     _has_memory_signal, _extract_log,
 )
 from app.persistence import persist_messages
@@ -44,6 +45,7 @@ def _clean():
 def test_memory_signal_words():
     assert _has_memory_signal("我常用 share-order 库")
     assert _has_memory_signal("以后都用柱状图")
+    assert _has_memory_signal("默认按月汇总")
     assert not _has_memory_signal("帮我查一下订单")
 
 
@@ -73,6 +75,7 @@ def test_memories_upsert_and_get(isolated_storage):
     extract_and_store_memories(llm, 1, "alice", "s1", "我常用 share-order 库", "好的")
     mems = get_user_memories(1)
     assert len(mems) == 1 and mems[0]["key"] == "常用库"
+    assert mems[0]["source_session"] == "s1" and mems[0]["updated_at"]
     assert get_user_memories(2) == []  # 用户隔离
 
 
@@ -105,6 +108,15 @@ def test_summary_not_due_below_turns(isolated_storage):
     assert summary_due("s1") is False
 
 
+def test_summary_info_contains_update_time(isolated_storage):
+    llm = FakeLLM(responses=["摘要内容"])
+    for i in range(5):
+        persist_messages("s-summary", [HumanMessage(content=f"q{i}")], user_id=1)
+    generate_summary(llm, "s-summary", [HumanMessage(content="q")])
+    info = get_summary_info("s-summary")
+    assert info["summary"] == "摘要内容" and info["updated_at"]
+
+
 def test_generate_summary_bad_response(isolated_storage):
     llm = FakeLLM(responses=[""])
     for i in range(5):
@@ -128,6 +140,7 @@ def test_retrieve_relevant(isolated_storage):
     hits = retrieve_relevant("s1", "订单")
     assert len(hits) >= 1
     assert any("订单" in h["content"] for h in hits)
+    assert all(h["session_id"] == "s1" and h["updated_at"] for h in hits)
 
 
 def test_retrieve_no_keywords_returns_empty(isolated_storage):
@@ -149,9 +162,33 @@ def test_build_memory_context_combines_all(isolated_storage):
     ctx = build_memory_context(1, "s1", "上个月订单多少")
     assert ctx is not None
     assert "长期记忆" in ctx and "常用库" in ctx
-    assert "历史摘要" in ctx
+    assert "历史摘要" in ctx and "来源会话：s1" in ctx
     assert "相关的历史对话" in ctx and "订单" in ctx
 
 
 def test_build_memory_context_none_when_empty(isolated_storage):
     assert build_memory_context(1, "no-such-session", "你好") is None
+
+
+def test_analysis_record_can_be_reused_with_source_and_time(isolated_storage):
+    plan = {
+        "goal": "统计订单数",
+        "metrics": ["订单数"],
+        "dimensions": ["地区"],
+        "steps": [{"id": "q", "title": "查询", "kind": "query", "depends_on": []}],
+    }
+    assert save_analysis_record(
+        1, "s-analysis", "统计各地区订单数", plan,
+        [{"source": "query_mysql", "sql": "SELECT region, COUNT(*) FROM orders", "row_count": 2}],
+        "北京 120 单，上海 80 单",
+    )
+    hits = retrieve_relevant_analysis(1, "统计各地区订单数量")
+    assert len(hits) == 1
+    assert hits[0]["plan"]["goal"] == "统计订单数"
+    assert hits[0]["evidence"][0]["row_count"] == 2
+    ctx = build_memory_context(1, "s-current", "统计各地区订单数量")
+    assert "相似历史分析" in ctx
+    assert "可复用计划" in ctx and "来源会话：s-analysis" in ctx
+    assert "当前数据、当前口径和当前查询结果优先" in ctx
+    assert delete_analysis_records("s-analysis", 1) == 1
+    assert retrieve_relevant_analysis(1, "统计各地区订单数量") == []

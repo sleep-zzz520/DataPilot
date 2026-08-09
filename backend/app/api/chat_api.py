@@ -2,7 +2,8 @@ from __future__ import annotations
 import asyncio, re, json, io, uuid, threading, time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Literal
+from hashlib import sha256
 import pandas as pd
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from fastapi.responses import StreamingResponse
@@ -15,13 +16,15 @@ from app.core.factories import build_llm, build_engine
 from app.tools.agent_tools import make_tools
 from app.agent.multi_agent import make_agent
 from app.errors.classifier import classify_any
-from app.audit import record, A_FILE_UPLOAD, A_SESSION_ACTION
+from app.audit import record, A_FILE_UPLOAD, A_SESSION_ACTION, A_HITL_CONFIRMATION
 from app.usage import check_budget, record_usage, extract_usage
 from app.memory.agent_memory import (
     build_memory_context, extract_and_store_memories, summary_due, generate_summary,
+    save_analysis_record, delete_analysis_records,
 )
 from app.db.schema import list_tables
-from app.agent.analysis_plan import make_analysis_plan_graph, PlanRuntime, plan_context
+from app.agent.analysis_plan import AnalysisPlan, make_analysis_plan_graph, PlanRuntime, plan_context
+from app.agent.hitl import assess_confirmation
 from app.memory import get_history, save_messages, clear_session
 from app.memory.store import budget_history, estimate_tokens, MAX_TOKENS
 from app.agent.graph import _filter_new_messages
@@ -40,6 +43,8 @@ from app.persistence import (
     get_upload,
     save_trace,
     load_traces,
+    save_pending_approval,
+    consume_pending_approval,
 )
 from app.api.auth_api import get_current_user
 
@@ -94,9 +99,12 @@ _dedup: dict = {}
 _dedup_lock = threading.Lock()
 
 
-def _check_duplicate(sid: str, message: str, file_ids: Optional[list]) -> Optional[str]:
+def _check_duplicate(sid: str, message: str, file_ids: Optional[list],
+                     approval_id: Optional[str] = None,
+                     approval_decision: Optional[str] = None) -> Optional[str]:
     """记录本次请求键；30 秒内同会话相同请求返回提示，否则返回 None（放行）。"""
-    key = (sid, (message or "").strip(), tuple(sorted(file_ids or [])))
+    base = (sid, (message or "").strip(), tuple(sorted(file_ids or [])))
+    key = base + (approval_id, approval_decision) if approval_id else base
     now = time.time()
     with _dedup_lock:
         # 顺手清理过期键，防止字典无限增长
@@ -132,6 +140,8 @@ class ChatRequest(BaseModel):
     llm_config_id: int
     db_config_id: int
     file_ids: List = []
+    approval_id: Optional[str] = None
+    approval_decision: Optional[Literal["approve", "reject"]] = None
 
 _CHART_RE = re.compile(r"<!--CHART:(.*?)-->", re.S)
 _TABLE_RE = re.compile(r"<!--TABLE:(.*?)-->", re.S)
@@ -152,6 +162,73 @@ def _build_plan(llm, engine, question: str, schema: Optional[str], file_ids: lis
     })
     plan = result["plan"]
     return plan, {"type": "plan", "event": "plan_created", "plan": plan.model_dump(exclude_none=True)}
+
+
+def _request_hash(req: ChatRequest, sid: str) -> str:
+    """确认必须绑定原始请求和配置，避免 token 被换会话/换数据源重放。"""
+    raw = json.dumps({
+        "session_id": sid,
+        "message": (req.message or "").strip(),
+        "file_ids": sorted(str(fid) for fid in (req.file_ids or [])),
+        "llm_config_id": req.llm_config_id,
+        "db_config_id": req.db_config_id,
+    }, ensure_ascii=False, sort_keys=True)
+    return sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _audit_hitl(user: dict, sid: str, status: str, confirmation: dict,
+                approval_id: Optional[str] = None) -> None:
+    record(A_HITL_CONFIRMATION, user["uid"], user.get("username"), {
+        "status": status,
+        "approval_id": approval_id,
+        "session_id": sid,
+        "reasons": confirmation.get("reasons", []),
+        "data_scope": confirmation.get("data_scope", []),
+        "estimated_cost": confirmation.get("estimated_cost", {}),
+    })
+
+
+def _resolve_plan(req: ChatRequest, sid: str, llm, engine, schema: Optional[str], user: dict) -> dict:
+    """计划生成后的执行门禁；返回 ready/confirmation/rejected，拒绝不创建工具调用。"""
+    request_hash = _request_hash(req, sid)
+    if req.approval_id:
+        if not req.approval_decision:
+            raise ValueError("确认请求缺少 approval_decision")
+        result = consume_pending_approval(
+            req.approval_id, user["uid"], sid, request_hash, req.approval_decision,
+        )
+        if result["status"] == "invalid":
+            raise ValueError(result["reason"])
+        confirmation = result["payload"]["confirmation"]
+        _audit_hitl(user, sid, result["status"], confirmation, req.approval_id)
+        if result["status"] == "rejected":
+            return {"kind": "rejected", "confirmation": confirmation}
+        plan_data = result["payload"]["plan"]
+        return {
+            "kind": "ready",
+            "plan": AnalysisPlan.model_validate(plan_data),
+            "plan_event": {"type": "plan", "event": "plan_resumed", "plan": plan_data},
+        }
+
+    plan, plan_event = _build_plan(llm, engine, req.message, schema, req.file_ids, user["uid"])
+    file_metadata = [get_upload(str(fid), user["uid"]) or {} for fid in req.file_ids]
+    confirmation = assess_confirmation(req.message, plan, file_metadata)
+    if not confirmation.get("required"):
+        return {"kind": "ready", "plan": plan, "plan_event": plan_event}
+    if confirmation.get("mode") == "clarification":
+        _audit_hitl(user, sid, "clarification_required", confirmation)
+        return {"kind": "confirmation", "plan": plan, "confirmation": confirmation,
+                "plan_event": plan_event}
+
+    approval_id = str(uuid.uuid4())
+    confirmation = {**confirmation, "approval_id": approval_id, "status": "pending"}
+    save_pending_approval(
+        approval_id, user["uid"], sid, request_hash,
+        {"plan": plan.model_dump(exclude_none=True), "confirmation": confirmation},
+    )
+    _audit_hitl(user, sid, "requested", confirmation, approval_id)
+    return {"kind": "confirmation", "plan": plan, "confirmation": confirmation,
+            "plan_event": plan_event}
 
 
 def _guard_reply(reply: str, plan, validation_status: Optional[str] = None) -> str:
@@ -218,7 +295,7 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
     async with lock:  # 同一会话串行处理，避免并发交错
         try:
             # ── 同请求防重：30s 内相同请求拒绝，不调 LLM ──────────────────
-            dup = _check_duplicate(sid, req.message, req.file_ids)
+            dup = _check_duplicate(sid, req.message, req.file_ids, req.approval_id, req.approval_decision)
             if dup:
                 return {"reply": None, "chart": None, "table": None, "sql": None, "session_id": sid,
                         "error": {"code": "DUPLICATE_REQUEST", "message": "重复提交",
@@ -232,6 +309,20 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             llm = build_llm(get_llm_secret(req.llm_config_id))
             db_cfg = get_db_secret(req.db_config_id)
             engine = build_engine(db_cfg)
+            resolution = _resolve_plan(req, sid, llm, engine, db_cfg.get("default_schema"), user)
+            plan = resolution.get("plan")
+            if resolution["kind"] == "rejected":
+                return {"reply": "已拒绝本次分析，未执行查询。", "visuals": [], "tables": [],
+                        "chart": None, "table": None, "sql": None, "session_id": sid,
+                        "confirmation": {**resolution["confirmation"], "status": "rejected"},
+                        "plan": plan.model_dump(exclude_none=True) if plan else None}
+            if resolution["kind"] == "confirmation":
+                confirmation = resolution["confirmation"]
+                return {"reply": confirmation.get("prompt") or "执行前需要你的确认。",
+                        "visuals": [], "tables": [], "chart": None, "table": None, "sql": None,
+                        "session_id": sid, "confirmation": confirmation,
+                        "plan": plan.model_dump(exclude_none=True), "evidence": [], "trace": []}
+
             # 上传文件 → DataFrame 字典（供 file_tool 真实查询，磁盘+LRU）
             uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
             tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
@@ -242,7 +333,6 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
                 if meta:
                     ctx += f"\n[用户上传文件 {meta['name']}] 列：{meta['columns']} 预览行：{meta['preview_rows']}\n"
             user_text = (ctx + "\n" + req.message) if ctx else req.message
-            plan, _plan_event = _build_plan(llm, engine, req.message, db_cfg.get("default_schema"), req.file_ids, user["uid"])
             runtime = PlanRuntime(plan, req.message)
             trace = TraceCollector()
             graph, supervisor_prompt = make_agent(llm, tools, trace=trace, plan_runtime=runtime)
@@ -261,12 +351,6 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             input_messages = [
                 SystemMessage(content=system_prompt)
             ] + history + [HumanMessage(content=user_text)]
-
-            if plan.clarification_needed:
-                reply = plan.clarification_question or "当前指标口径不明确，请补充确认后再执行。"
-                return {"reply": reply, "visuals": [], "tables": [], "chart": None, "table": None,
-                        "sql": None, "session_id": sid, "plan": plan.model_dump(exclude_none=True),
-                        "evidence": [], "trace": []}
 
             result = await asyncio.to_thread(graph.invoke, {"messages": input_messages})
             result_messages = result["messages"]
@@ -304,6 +388,7 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
                                        req.message, reply)
             if summary_due(sid):
                 generate_summary(llm, sid, result_messages)
+            save_analysis_record(user["uid"], sid, req.message, plan, plan.evidence, reply)
 
             # chart/table 字段保留兼容（取最后一个），前端主用 visuals/tables 数组
             return {
@@ -335,6 +420,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
       - delta: {"type":"delta","text":"..."}      回复文本增量
       - trace: {"type":"trace","entries":[...]}   本轮工具调用链增量（实时展示）
       - done:  {"type":"done","reply","chart","table","sql","session_id"}  最终结果
+        confirmation 字段存在时表示已暂停，必须带 approval_id + approval_decision 重试
       - error: {"type":"error","error":{...},"session_id"}                 异常
     """
     sid = req.session_id or str(uuid.uuid4())
@@ -345,7 +431,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         async with lock:  # 同一会话串行处理，避免并发交错
             try:
                 # ── 同请求防重：30s 内相同请求拒绝，不调 LLM ──────────────
-                dup = _check_duplicate(sid, req.message, req.file_ids)
+                dup = _check_duplicate(sid, req.message, req.file_ids, req.approval_id, req.approval_decision)
                 if dup:
                     yield _sse({"type": "error",
                                 "error": {"code": "DUPLICATE_REQUEST", "message": "重复提交",
@@ -363,6 +449,25 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 llm = build_llm(get_llm_secret(req.llm_config_id))
                 db_cfg = get_db_secret(req.db_config_id)
                 engine = build_engine(db_cfg)
+                resolution = _resolve_plan(req, sid, llm, engine, db_cfg.get("default_schema"), user)
+                plan = resolution.get("plan")
+                if resolution["kind"] == "rejected":
+                    yield _sse({"type": "done", "reply": "已拒绝本次分析，未执行查询。",
+                                "visuals": [], "tables": [], "chart": None, "table": None, "sql": None,
+                                "session_id": sid,
+                                "confirmation": {**resolution["confirmation"], "status": "rejected"},
+                                "plan": None, "evidence": [], "trace": []})
+                    return
+                if resolution.get("plan_event"):
+                    yield _sse(resolution["plan_event"])
+                if resolution["kind"] == "confirmation":
+                    confirmation = resolution["confirmation"]
+                    yield _sse({"type": "done", "reply": confirmation.get("prompt") or "执行前需要你的确认。",
+                                "visuals": [], "tables": [], "chart": None, "table": None, "sql": None,
+                                "session_id": sid, "confirmation": confirmation,
+                                "plan": plan.model_dump(exclude_none=True), "evidence": [], "trace": []})
+                    return
+
                 # 上传文件 → DataFrame 字典（供 file_tool 真实查询）
                 uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
                 tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
@@ -373,18 +478,10 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                     if meta:
                         ctx += f"\n[用户上传文件 {meta['name']}] 列：{meta['columns']} 预览行：{meta['preview_rows']}\n"
                 user_text = (ctx + "\n" + req.message) if ctx else req.message
-                plan, plan_event = _build_plan(llm, engine, req.message, db_cfg.get("default_schema"), req.file_ids, user["uid"])
-                yield _sse(plan_event)
                 plan_updates = []
                 runtime = PlanRuntime(plan, req.message, on_update=lambda snapshot: plan_updates.append(snapshot))
                 trace = TraceCollector()
                 graph, supervisor_prompt = make_agent(llm, tools, trace=trace, plan_runtime=runtime)
-
-                if plan.clarification_needed:
-                    yield _sse({"type": "done", "reply": plan.clarification_question or "当前指标口径不明确，请补充确认后再执行。",
-                                "visuals": [], "tables": [], "chart": None, "table": None, "sql": None,
-                                "session_id": sid, "plan": plan.model_dump(exclude_none=True), "evidence": [], "trace": []})
-                    return
 
                 _ensure_loaded(sid, user["uid"])
                 history = get_history(sid)
@@ -464,6 +561,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                                            req.message, reply)
                 if summary_due(sid):
                     generate_summary(llm, sid, result_messages)
+                save_analysis_record(user["uid"], sid, req.message, plan, plan.evidence, reply)
 
                 yield _sse({
                     "type": "done",
@@ -556,6 +654,7 @@ def api_delete_session(session_id: str, user: dict = Depends(get_current_user)):
     deleted = db_delete_session(session_id, user["uid"])
     if not deleted:
         raise HTTPException(status_code=404, detail="会话不存在")
+    delete_analysis_records(session_id, user["uid"])
     record(A_SESSION_ACTION, user["uid"], user.get("username"),
            {"action": "delete", "session_id": session_id})
     return {"ok": True}
