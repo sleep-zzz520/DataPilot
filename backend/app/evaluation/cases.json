@@ -1,0 +1,265 @@
+{
+  "version": 1,
+  "description": "离线黄金评测集：覆盖正常分析和五类高风险边界",
+  "cases": [
+    {
+      "id": "clean_monthly_orders",
+      "question": "统计2025年各地区每月已支付订单数，并按月份排序",
+      "gold": {
+        "aliases": {"订单数量": "订单数", "order_count": "订单数", "month": "月份"},
+        "plan": {
+          "goal_keywords": ["2025", "地区", "订单"],
+          "data_sources": ["orders"],
+          "metrics": ["订单数"],
+          "dimensions": ["地区", "月份"],
+          "filters": ["status=paid"],
+          "time_range": "2025-01-01 至 2025-12-31",
+          "grain": "month",
+          "required_step_kinds": ["query", "validate", "summarize"],
+          "clarification_needed": false
+        },
+        "sql": {
+          "read_only": true,
+          "required_fragments": ["select", "count", "region", "order_date", "status", "2025", "group by", "order by"],
+          "forbidden_fragments": ["customer_name", "salary"]
+        },
+        "validation": {"status": "approved", "must_be_clean": true},
+        "traceability": {
+          "min_evidence": 1,
+          "required_evidence_fields": ["source", "sql", "columns", "row_count", "quality_issues", "created_at"],
+          "reply_keywords": ["订单数", "SQL"],
+          "required_trace_tools": ["query_mysql"]
+        }
+      },
+      "prediction": {
+        "plan": {
+          "goal": "统计2025年各地区每月已支付订单数",
+          "data_sources": ["orders"],
+          "metrics": ["订单数量"],
+          "dimensions": ["地区", "月份"],
+          "filters": ["status=paid"],
+          "time_range": "2025-01-01 至 2025-12-31",
+          "grain": "month",
+          "clarification_needed": false,
+          "steps": [{"kind": "query"}, {"kind": "validate"}, {"kind": "summarize"}]
+        },
+        "sql": "SELECT region, DATE_FORMAT(order_date, '%Y-%m') AS month, COUNT(*) AS order_count FROM orders WHERE status = 'paid' AND order_date >= '2025-01-01' AND order_date < '2026-01-01' GROUP BY region, month ORDER BY month",
+        "validation": {"status": "approved", "issues": []},
+        "evidence": [{"source": "query_mysql", "sql": "SELECT region, COUNT(*) FROM orders", "columns": ["region", "month", "order_count"], "row_count": 24, "quality_issues": [], "created_at": "2026-08-09T10:00:00"}],
+        "trace": [{"tool": "query_mysql", "status": "ok"}],
+        "reply": "结论：2025年各地区每月订单数见表格。SQL 和样本量已附在证据中。"
+      }
+    },
+    {
+      "id": "empty_result",
+      "question": "查询2025年华北地区已支付订单数",
+      "gold": {
+        "plan": {
+          "goal_keywords": ["2025", "华北", "订单"],
+          "data_sources": ["orders"],
+          "metrics": ["订单数"],
+          "filters": ["region=华北"],
+          "time_range": "2025-01-01 至 2025-12-31",
+          "required_step_kinds": ["query", "validate", "summarize"],
+          "clarification_needed": false
+        },
+        "sql": {"read_only": true, "required_fragments": ["select", "count", "region", "order_date", "2025"]},
+        "validation": {"status": "rejected", "must_detect": ["查询返回空结果"]},
+        "traceability": {
+          "min_evidence": 1,
+          "required_evidence_fields": ["source", "sql", "row_count", "quality_issues", "created_at"],
+          "reply_keywords": ["空结果", "无法"]
+        }
+      },
+      "prediction": {
+        "plan": {
+          "goal": "查询2025年华北地区已支付订单数",
+          "data_sources": ["orders"],
+          "metrics": ["订单数"],
+          "filters": ["region=华北"],
+          "time_range": "2025-01-01 至 2025-12-31",
+          "clarification_needed": false,
+          "steps": [{"kind": "query"}, {"kind": "validate"}, {"kind": "summarize"}]
+        },
+        "sql": "SELECT COUNT(*) FROM orders WHERE region = '华北' AND order_date >= '2025-01-01' AND order_date < '2026-01-01'",
+        "validation": {"status": "rejected", "issues": ["查询返回空结果"]},
+        "evidence": [{"source": "query_mysql", "sql": "SELECT COUNT(*) FROM orders WHERE region = '华北'", "columns": ["count"], "row_count": 0, "quality_issues": ["查询返回空结果"], "created_at": "2026-08-09T10:01:00"}],
+        "trace": [{"tool": "query_mysql", "status": "ok"}],
+        "reply": "当前筛选条件返回空结果，无法据此生成订单结论。"
+      }
+    },
+    {
+      "id": "outlier_result",
+      "question": "检查各地区订单量中的异常值",
+      "gold": {
+        "plan": {
+          "goal_keywords": ["地区", "订单", "异常"],
+          "data_sources": ["orders"],
+          "metrics": ["订单数"],
+          "dimensions": ["地区"],
+          "required_step_kinds": ["query", "calculate", "validate", "summarize"],
+          "clarification_needed": false
+        },
+        "sql": {"read_only": true, "required_fragments": ["select", "region", "count", "group by"]},
+        "validation": {"status": "rejected", "must_detect": ["结果存在明显异常值"]},
+        "traceability": {
+          "min_evidence": 1,
+          "required_evidence_fields": ["source", "sql", "row_count", "quality_issues", "created_at"],
+          "reply_keywords": ["异常值", "样本量"]
+        }
+      },
+      "prediction": {
+        "plan": {
+          "goal": "检查各地区订单量中的异常值",
+          "data_sources": ["orders"],
+          "metrics": ["订单数"],
+          "dimensions": ["地区"],
+          "clarification_needed": false,
+          "steps": [{"kind": "query"}, {"kind": "calculate"}, {"kind": "validate"}, {"kind": "summarize"}]
+        },
+        "sql": "SELECT region, COUNT(*) AS order_count FROM orders GROUP BY region",
+        "validation": {"status": "rejected", "issues": ["结果存在明显异常值，请结合业务含义确认"]},
+        "evidence": [{"source": "query_mysql", "sql": "SELECT region, COUNT(*) AS order_count FROM orders GROUP BY region", "columns": ["region", "order_count"], "row_count": 5, "quality_issues": ["结果存在明显异常值，请结合业务含义确认"], "created_at": "2026-08-09T10:02:00"}],
+        "trace": [{"tool": "query_mysql", "status": "ok"}],
+        "reply": "检测到异常值，样本量为5，建议结合业务含义进一步确认。"
+      }
+    },
+    {
+      "id": "insufficient_sample",
+      "question": "对比一月和二月的订单量",
+      "gold": {
+        "plan": {
+          "goal_keywords": ["对比", "一月", "二月", "订单"],
+          "data_sources": ["orders"],
+          "metrics": ["订单数"],
+          "dimensions": ["月份"],
+          "required_step_kinds": ["query", "calculate", "validate", "summarize"],
+          "clarification_needed": false
+        },
+        "sql": {"read_only": true, "required_fragments": ["select", "count", "order_date", "group by"]},
+        "validation": {"status": "rejected", "must_detect": ["样本量不足"]},
+        "traceability": {
+          "min_evidence": 1,
+          "required_evidence_fields": ["source", "sql", "row_count", "quality_issues", "created_at"],
+          "reply_keywords": ["样本量不足", "无法"]
+        }
+      },
+      "prediction": {
+        "plan": {
+          "goal": "对比一月和二月的订单量",
+          "data_sources": ["orders"],
+          "metrics": ["订单数"],
+          "dimensions": ["月份"],
+          "clarification_needed": false,
+          "steps": [{"kind": "query"}, {"kind": "calculate"}, {"kind": "validate"}, {"kind": "summarize"}]
+        },
+        "sql": "SELECT DATE_FORMAT(order_date, '%Y-%m') AS month, COUNT(*) FROM orders WHERE order_date IN ('2025-01-01', '2025-02-01') GROUP BY month",
+        "validation": {"status": "rejected", "issues": ["样本量不足，无法支持比较类结论"]},
+        "evidence": [{"source": "query_mysql", "sql": "SELECT month, COUNT(*) FROM orders", "columns": ["month", "count"], "row_count": 1, "quality_issues": ["样本量不足，无法支持比较类结论"], "created_at": "2026-08-09T10:03:00"}],
+        "trace": [{"tool": "query_mysql", "status": "ok"}],
+        "reply": "样本量不足，无法对一月和二月给出可靠比较结论。"
+      }
+    },
+    {
+      "id": "metric_definition_conflict",
+      "question": "分析客户价值和高价值客户占比",
+      "gold": {
+        "plan": {"goal_keywords": ["客户", "价值"], "clarification_needed": true},
+        "sql": {"not_executed": true},
+        "validation": {"status": "clarification", "must_detect": ["指标口径冲突"]},
+        "traceability": {"not_required": true}
+      },
+      "prediction": {
+        "plan": {
+          "goal": "分析客户价值和高价值客户占比",
+          "clarification_needed": true,
+          "clarification_question": "请确认客户价值的计算口径，以及高价值客户的阈值。",
+          "steps": [{"kind": "validate"}]
+        },
+        "sql": null,
+        "validation": {"status": "clarification", "issues": ["指标口径冲突，需用户确认"]},
+        "evidence": [],
+        "trace": [],
+        "reply": "当前存在指标口径冲突，请先确认客户价值的计算口径。"
+      }
+    },
+    {
+      "id": "wrong_field_guard",
+      "question": "查询2025年各地区订单数",
+      "gold": {
+        "plan": {
+          "goal_keywords": ["2025", "地区", "订单"],
+          "data_sources": ["orders"],
+          "metrics": ["订单数"],
+          "dimensions": ["地区"],
+          "time_range": "2025-01-01 至 2025-12-31",
+          "required_step_kinds": ["query", "validate", "summarize"],
+          "clarification_needed": false
+        },
+        "sql": {"read_only": true, "required_fragments": ["select", "region", "count", "order_date", "group by"]},
+        "validation": {"status": "approved", "must_be_clean": true},
+        "traceability": {
+          "min_evidence": 1,
+          "required_evidence_fields": ["source", "sql", "row_count", "created_at"],
+          "reply_keywords": ["订单数"]
+        }
+      },
+      "prediction": {
+        "plan": {
+          "goal": "查询2025年各地区订单数",
+          "data_sources": ["orders"],
+          "metrics": ["订单数"],
+          "dimensions": ["地区"],
+          "time_range": "2025-01-01 至 2025-12-31",
+          "clarification_needed": false,
+          "steps": [{"kind": "query"}, {"kind": "validate"}, {"kind": "summarize"}]
+        },
+        "sql": "SELECT region, COUNT(*) AS order_count FROM orders WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01' GROUP BY region",
+        "validation": {"status": "approved", "issues": []},
+        "evidence": [{"source": "query_mysql", "sql": "SELECT region, COUNT(*) FROM orders", "columns": ["region", "order_count"], "row_count": 4, "quality_issues": [], "created_at": "2026-08-09T10:04:00"}],
+        "trace": [{"tool": "query_mysql", "status": "ok"}],
+        "reply": "2025年各地区订单数已完成统计。"
+      }
+    },
+    {
+      "id": "time_range_guard",
+      "question": "统计2024年销售额趋势",
+      "gold": {
+        "plan": {
+          "goal_keywords": ["2024", "销售额", "趋势"],
+          "data_sources": ["orders"],
+          "metrics": ["销售额"],
+          "dimensions": ["月份"],
+          "time_range": "2024-01-01 至 2024-12-31",
+          "grain": "month",
+          "required_step_kinds": ["query", "calculate", "validate", "summarize"],
+          "clarification_needed": false
+        },
+        "sql": {"read_only": true, "required_fragments": ["select", "amount", "order_date", "2024", "group by"]},
+        "validation": {"status": "approved", "must_be_clean": true},
+        "traceability": {
+          "min_evidence": 1,
+          "required_evidence_fields": ["source", "sql", "row_count", "created_at"],
+          "reply_keywords": ["销售额", "2024"]
+        }
+      },
+      "prediction": {
+        "plan": {
+          "goal": "统计2024年销售额趋势",
+          "data_sources": ["orders"],
+          "metrics": ["销售额"],
+          "dimensions": ["月份"],
+          "time_range": "2024-01-01 至 2024-12-31",
+          "grain": "month",
+          "clarification_needed": false,
+          "steps": [{"kind": "query"}, {"kind": "calculate"}, {"kind": "validate"}, {"kind": "summarize"}]
+        },
+        "sql": "SELECT DATE_FORMAT(order_date, '%Y-%m') AS month, SUM(amount) AS sales_amount FROM orders WHERE order_date >= '2024-01-01' AND order_date < '2025-01-01' GROUP BY month",
+        "validation": {"status": "approved", "issues": []},
+        "evidence": [{"source": "query_mysql", "sql": "SELECT month, SUM(amount) FROM orders", "columns": ["month", "sales_amount"], "row_count": 12, "quality_issues": [], "created_at": "2026-08-09T10:05:00"}],
+        "trace": [{"tool": "query_mysql", "status": "ok"}],
+        "reply": "2024年销售额趋势已完成，SQL 和样本量均可追溯。"
+      }
+    }
+  ]
+}

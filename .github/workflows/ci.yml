@@ -34,6 +34,16 @@ jobs:
       - name: pytest 单测（核心逻辑）
         run: python -m pytest tests/
 
+      - name: 离线分析评测集（计划/SQL/校验/可追溯性）
+        run: python -m app.evaluation --output /tmp/analysis-evaluation.json
+
+      - name: 上传分析评测报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-evaluation-report
+          path: /tmp/analysis-evaluation.json
+
       - name: 启动冒烟测试（/api/health）
         run: |
           (python app/main.py > /tmp/backend.log 2>&1 &) && \
