@@ -1,10 +1,12 @@
-"""多智能体协作（multi_agent.py）单测：专家分组 / 子图执行 / 主管路由 / 回退。"""
+"""P1 分析角色：角色注册 / 验证门禁 / 子图执行 / 主管路由。"""
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 
-from app.agent.multi_agent import make_agent, SQL_TOOL_NAMES, VIZ_TOOL_NAMES, FILE_TOOL_NAMES
+from app.agent.multi_agent import (
+    make_agent, SQL_TOOL_NAMES, VIZ_TOOL_NAMES, FILE_TOOL_NAMES, STAT_TOOL_NAMES,
+)
 from app.agent.prompts import SUPERVISOR_PROMPT
 from app.tools.agent_tools import make_tools
 
@@ -48,34 +50,36 @@ def _all_tools():
 # ── 专家分组 ──────────────────────────────────────────────────────────────────
 def test_tool_name_groups_cover_all():
     names = {t.name for t in _all_tools()}
-    grouped = set(SQL_TOOL_NAMES) | set(VIZ_TOOL_NAMES) | set(FILE_TOOL_NAMES)
+    grouped = set(SQL_TOOL_NAMES) | set(VIZ_TOOL_NAMES) | set(FILE_TOOL_NAMES) | set(STAT_TOOL_NAMES)
     assert names == grouped  # 所有工具都归属某个专家，无遗漏
 
 
-def test_make_agent_registers_three_experts():
+def test_make_agent_registers_analysis_roles():
     llm = FakeLLM(responses=[AIMessage(content="ok")])
     graph, prompt = make_agent(llm, _all_tools())
     assert prompt == SUPERVISOR_PROMPT
-    expert_names = [t.name for t in llm.last_bound_tools]
-    assert expert_names == ["sql_expert", "viz_expert", "file_expert"]
+    role_names = [t.name for t in llm.last_bound_tools]
+    assert role_names == ["data_executor", "statistical_validator", "insight_writer"]
 
 
-def test_make_agent_no_files_drops_file_expert():
+def test_make_agent_keeps_data_role_without_files():
     llm = FakeLLM(responses=[AIMessage(content="ok")])
-    # 无上传文件 → 无 file 工具 → 只有 2 个专家
+    # 无上传文件时，数据执行角色仍负责 MySQL；角色边界不随数据源消失。
     graph, prompt = make_agent(llm, make_tools(None, files={}))
-    expert_names = [t.name for t in llm.last_bound_tools]
-    assert "file_expert" not in expert_names
-    assert "sql_expert" in expert_names and "viz_expert" in expert_names
+    role_names = [t.name for t in llm.last_bound_tools]
+    assert role_names == ["data_executor", "statistical_validator", "insight_writer"]
 
 
 # ── 主管路由 + 专家执行（顺序消费 FakeLLM responses）─────────────────────────
-def test_supervisor_routes_sql_then_final_answer():
+def test_supervisor_routes_data_validate_then_insight():
     llm = FakeLLM(responses=[
-        _tool_call("sql_expert", {"request": "查询订单数量"}, "c1"),   # 主管 → 调 SQL 专家
-        _tool_call("query_mysql", {"sql": "SELECT COUNT(*) FROM t"}, "c2"),  # 专家 → 调查询工具
-        AIMessage(content="查询完成：共 120 单"),                          # 专家 → 总结
-        AIMessage(content="上月共 **120** 单。"),                          # 主管 → 最终回答
+        _tool_call("data_executor", {"request": "查询订单数量"}, "c1"),
+        _tool_call("query_mysql", {"sql": "SELECT COUNT(*) FROM t"}, "c2"),
+        AIMessage(content="已取得订单证据：共 120 单"),
+        _tool_call("statistical_validator", {"request": "检查订单证据"}, "c3"),
+        _tool_call("insight_writer", {"request": "基于已通过验证的订单证据回答"}, "c4"),
+        AIMessage(content="上月订单数为 120 单，口径为订单记录数。"),
+        AIMessage(content="上月共 **120** 单。"),
     ])
     graph, _ = make_agent(llm, _all_tools())
     result = graph.invoke({"messages": [HumanMessage(content="上月订单数？")]})
@@ -87,7 +91,7 @@ def test_supervisor_routes_sql_then_final_answer():
 
 def test_supervisor_routes_viz_expert():
     llm = FakeLLM(responses=[
-        _tool_call("viz_expert", {"request": "画柱状图，数据 A:10 B:20"}, "c1"),
+        _tool_call("insight_writer", {"request": "画柱状图，数据 A:10 B:20"}, "c1"),
         _tool_call("make_chart", {"chart_type": "bar", "title": "对比", "x_labels": ["A", "B"],
                                   "series": [{"name": "s", "data": [10, 20]}]}, "c2"),
         AIMessage(content="已生成柱状图"),
@@ -120,9 +124,9 @@ def test_fallback_when_no_tools():
 
 # ── 图表标记回传（前端渲染的关键）────────────────────────────────────────────
 def test_viz_expert_forwards_chart_markup():
-    """专家最终回复没带 CHART 标记时，标记也必须从子图 ToolMessage 带回主管层。"""
+    """洞察角色最终回复没带 CHART 标记时，标记也必须回传主管层。"""
     llm = FakeLLM(responses=[
-        _tool_call("viz_expert", {"request": "画柱状图"}, "c1"),          # 主管 → 专家
+        _tool_call("insight_writer", {"request": "画柱状图"}, "c1"),
         _tool_call("make_chart", {"chart_type": "bar", "title": "对比",
                                   "x_labels": ["A"], "series": [{"name": "s", "data": [1]}]}, "c2"),  # 专家 → 图表工具
         AIMessage(content="已生成柱状图"),                                   # 专家回复（无标记）
@@ -134,3 +138,60 @@ def test_viz_expert_forwards_chart_markup():
     chart_found = any("<!--CHART:" in (m.content or "") for m in result["messages"])
     assert chart_found, "专家子图的 CHART 标记必须回传到主管层，否则前端无图"
     assert result["messages"][-1].content == "已为您生成柱状图。"
+
+
+def test_insight_writer_is_blocked_before_validation():
+    """即使 Supervisor 误路由，表达角色也不能在验证前生成洞察。"""
+    from app.agent.analysis_plan import AnalysisPlan, PlanRuntime
+
+    runtime = PlanRuntime(AnalysisPlan(goal="统计订单"), "统计订单")
+    llm = FakeLLM(responses=[
+        _tool_call("insight_writer", {"request": "直接给订单结论"}, "c1"),
+        AIMessage(content="已停止，等待统计验证。"),
+    ])
+    graph, _ = make_agent(llm, _all_tools(), plan_runtime=runtime)
+    result = graph.invoke({"messages": [HumanMessage(content="统计订单")]})
+    assert runtime.validation_status == "pending"
+    assert "验证尚未通过" in result["messages"][2].content
+
+
+def test_validator_subgraph_uses_python_statistical_tool(monkeypatch):
+    """有真实证据时，验证角色可把趋势计算交给统一统计工具。"""
+    import pandas as pd
+    from app.agent.analysis_plan import AnalysisPlan, PlanRuntime, PlanStep
+
+    monkeypatch.setattr(pd, "read_sql", lambda sql, engine: pd.DataFrame({
+        "month": ["2025-01-01", "2025-02-01", "2025-03-01"],
+        "sales": [10, 20, 30],
+    }))
+    runtime = PlanRuntime(AnalysisPlan(
+        goal="分析销售趋势", metrics=["销售额"],
+        steps=[PlanStep(id="q", title="查询", kind="query"),
+               PlanStep(id="v", title="验证", kind="validate")],
+    ), "趋势")
+    llm = FakeLLM(responses=[
+        _tool_call("data_executor", {"request": "查询趋势"}, "c1"),
+        _tool_call("query_mysql", {"sql": "SELECT month, sales FROM t"}, "c2"),
+        AIMessage(content="已取得 month 和 sales 证据。"),
+        _tool_call("statistical_validator", {"request": (
+            "请用真实证据计算趋势，records=[{\"month\":\"2025-01-01\",\"sales\":10},"
+            "{\"month\":\"2025-02-01\",\"sales\":20},{\"month\":\"2025-03-01\",\"sales\":30}]，"
+            "调用 analyze_trend_tool。"
+        )}, "c3"),
+        _tool_call("analyze_trend_tool", {"data": [
+            {"month": "2025-01-01", "sales": 10},
+            {"month": "2025-02-01", "sales": 20},
+            {"month": "2025-03-01", "sales": 30},
+        ], "period_col": "month", "value_col": "sales"}, "c4"),
+        AIMessage(content="趋势统计已完成，斜率为 10。"),
+        _tool_call("insight_writer", {"request": "基于验证报告给出趋势结论"}, "c5"),
+        AIMessage(content="销售额呈上升趋势。"),
+        AIMessage(content="销售额呈上升趋势。"),
+    ])
+    graph, _ = make_agent(llm, _all_tools(), plan_runtime=runtime)
+    result = graph.invoke({"messages": [HumanMessage(content="销售趋势？")]})
+    assert runtime.validation_status == "approved"
+    validator_result = next(message.content for message in result["messages"]
+                            if message.type == "tool" and message.name == "statistical_validator")
+    assert "趋势统计已完成" in validator_result
+    assert '"sample_size"' in validator_result and '"intermediate"' in validator_result

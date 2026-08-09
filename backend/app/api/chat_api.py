@@ -85,7 +85,7 @@ def _load_uploaded_dfs(file_ids: List, user_id: int) -> dict:
 # 每个 session 一个 asyncio 锁：串行化同一会话的对话处理，
 # 避免并发请求交错读写内存/SQLite 导致消息错乱（串话、重复）。
 _chat_locks: dict = {}
-_chat_locks_guard: "asyncio.Lock | None" = None
+_chat_locks_guard: Optional[asyncio.Lock] = None
 
 # ── 同请求防重（30s 窗口）：同会话 + 相同消息 + 相同 file_ids 视为重复提交，
 # 直接拒绝不调 LLM（防多 tab/重放导致的历史重复分析与 token 浪费）────────────
@@ -154,9 +154,12 @@ def _build_plan(llm, engine, question: str, schema: Optional[str], file_ids: lis
     return plan, {"type": "plan", "event": "plan_created", "plan": plan.model_dump(exclude_none=True)}
 
 
-def _guard_reply(reply: str, plan) -> str:
+def _guard_reply(reply: str, plan, validation_status: Optional[str] = None) -> str:
     """质量校验未通过时，把限制明确呈现给用户，避免模型只给确定性结论。"""
     warnings = list(dict.fromkeys(plan.quality_issues))
+    if plan.metrics and validation_status and validation_status != "approved":
+        detail = "；".join(warnings) if warnings else "尚未完成真实证据的统计验证"
+        return "本轮统计验证未通过，暂不生成确定性结论。原因：" + detail + "。"
     if warnings:
         return (reply or "") + "\n\n> 结果质量提示：" + "；".join(warnings) + "。以上结论仅供参考，请补充数据或调整口径后重试。"
     if plan.metrics and not plan.evidence:
@@ -287,7 +290,7 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             msgs = result_messages
             visuals, tables, sql = _extract(msgs)
             reply = msgs[-1].content if isinstance(msgs[-1], AIMessage) else ""
-            reply = _guard_reply(reply, plan)
+            reply = _guard_reply(reply, plan, runtime.validation_status)
 
             # ── token 用量计量（成本估算 + 预算告警）──────────────────────
             llm_cfg = get_llm_secret(req.llm_config_id)
@@ -454,7 +457,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                     if isinstance(m, AIMessage) and m.content:
                         reply = m.content
                         break
-                reply = _guard_reply(reply, plan)
+                reply = _guard_reply(reply, plan, runtime.validation_status)
 
                 # ── 记忆沉淀：节流提取长期事实 + 节流更新会话摘要 ──────────
                 extract_and_store_memories(llm, user["uid"], user.get("username"), sid,

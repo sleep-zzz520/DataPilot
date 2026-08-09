@@ -60,9 +60,10 @@ function toggle(seq) {
 
 const AGENT_LABELS = {
   supervisor: '主管',
-  sql_expert: 'SQL 专家',
-  viz_expert: '可视化专家',
-  file_expert: '文件专家',
+  analysis_planner: '分析规划',
+  data_executor: '数据执行',
+  statistical_validator: '统计验证',
+  insight_writer: '洞察表达',
   agent: 'Agent'
 }
 
@@ -141,9 +142,10 @@ function statusLabel(s) {
   color: var(--text-secondary);
 }
 .trace-agent.agent-supervisor { background: #1F1F1F; color: #fff; }
-.trace-agent.agent-sql_expert { background: #E8F0FE; color: #1A56DB; }
-.trace-agent.agent-viz_expert { background: #F3E8FF; color: #9333EA; }
-.trace-agent.agent-file_expert { background: #E6F7EE; color: #15803D; }
+.trace-agent.agent-analysis_planner { background: #FFF1E6; color: #C2410C; }
+.trace-agent.agent-data_executor { background: #E8F0FE; color: #1A56DB; }
+.trace-agent.agent-statistical_validator { background: #E6F7EE; color: #15803D; }
+.trace-agent.agent-insight_writer { background: #F3E8FF; color: #9333EA; }
 .trace-agent.agent-agent { background: #FEF3C7; color: #B45309; }
 
 .trace-tool {
@@ -218,4 +220,3 @@ function statusLabel(s) {
   overflow-y: auto;
 }
 </style>
-

@@ -27,6 +27,18 @@ export async function streamChat(payload, { onDelta, onTrace, onPlan, onDone, on
   const reader = resp.body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
+  const dispatchFrame = (frame) => {
+    for (const line of frame.split('\n')) {
+      if (!line.startsWith('data: ')) continue
+      let ev
+      try { ev = JSON.parse(line.slice(6)) } catch (_) { continue }
+      if (ev.type === 'delta' && onDelta) onDelta(ev.text || '')
+      else if (ev.type === 'trace' && onTrace) onTrace(ev.entries || [])
+      else if (ev.type === 'plan' && onPlan) onPlan(ev.plan || null)
+      else if (ev.type === 'done' && onDone) onDone(ev)
+      else if (ev.type === 'error' && onError) onError(ev.error)
+    }
+  }
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
@@ -35,18 +47,11 @@ export async function streamChat(payload, { onDelta, onTrace, onPlan, onDone, on
     while ((sep = buf.indexOf('\n\n')) >= 0) {
       const frame = buf.slice(0, sep)
       buf = buf.slice(sep + 2)
-      for (const line of frame.split('\n')) {
-        if (!line.startsWith('data: ')) continue
-        let ev
-        try { ev = JSON.parse(line.slice(6)) } catch (_) { continue }
-        if (ev.type === 'delta' && onDelta) onDelta(ev.text || '')
-        else if (ev.type === 'trace' && onTrace) onTrace(ev.entries || [])
-        else if (ev.type === 'plan' && onPlan) onPlan(ev.plan || null)
-        else if (ev.type === 'done' && onDone) onDone(ev)
-        else if (ev.type === 'error' && onError) onError(ev.error)
-      }
+      dispatchFrame(frame)
     }
   }
+  // 兼容代理/开发服务器在连接关闭时未补最后一个空行的情况。
+  if (buf.trim()) dispatchFrame(buf)
 }
 export const upload = (file) => { const fd = new FormData(); fd.append('file', file); return http.post('/api/upload', fd) }
 export const schema = (dbConfigId) => http.get('/api/schema', { params: { db_config_id: dbConfigId } })

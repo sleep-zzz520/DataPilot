@@ -182,8 +182,11 @@ def test_astream_emits_trace_deltas():
 # ── 多智能体：主管 + 专家全链路轨迹 ──────────────────────────────────────────
 def test_multi_agent_nested_trace():
     llm = FakeLLM(responses=[
-        _tool_call("sql_expert", {"request": "查询订单数量"}, "c1"),
+        _tool_call("data_executor", {"request": "查询订单数量"}, "c1"),
         _tool_call("query_mysql", {"sql": "SELECT COUNT(*) FROM t"}, "c2"),
+        _answer("已取得查询证据：共 120 单"),
+        _tool_call("statistical_validator", {"request": "检查证据"}, "c3"),
+        _tool_call("insight_writer", {"request": "表达已验证证据"}, "c4"),
         _answer("查询完成：共 120 单"),
         _answer("上月共 **120** 单。"),
     ])
@@ -192,8 +195,10 @@ def test_multi_agent_nested_trace():
     graph.invoke({"messages": [HumanMessage(content="上月订单数？")]})
     # 主管入口 + 专家内部工具，链路完整且层级正确
     assert [(e["agent"], e["tool"], e["depth"], e["status"]) for e in c.entries] == [
-        ("supervisor", "sql_expert", 0, "ok"),
-        ("sql_expert", "query_mysql", 1, "ok"),
+        ("supervisor", "data_executor", 0, "ok"),
+        ("data_executor", "query_mysql", 1, "ok"),
+        ("supervisor", "statistical_validator", 0, "ok"),
+        ("supervisor", "insight_writer", 0, "ok"),
     ]
     assert "SELECT COUNT(*) FROM t" in c.entries[1]["input"]
     assert "120" in c.entries[1]["output"] or "120" in c.entries[0]["output"]

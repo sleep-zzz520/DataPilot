@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 import duckdb
@@ -36,7 +36,7 @@ def _to_md(df: pd.DataFrame, max_rows: int = None) -> str:
     return "\n".join([head, sep, body])
 
 
-def make_file_tools(files: Dict[str, pd.DataFrame], audit_ctx: Dict | None = None) -> List:
+def make_file_tools(files: Dict[str, pd.DataFrame], audit_ctx: Optional[Dict] = None) -> List:
     """根据当前对话的上传文件构造文件分析工具。
 
     files: {文件名: DataFrame}

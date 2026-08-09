@@ -56,3 +56,38 @@ def test_plan_runtime_records_evidence_and_quality_issue():
     assert plan.evidence[0]["row_count"] == 1
     assert plan.steps[0].status == "succeeded"
     assert plan.steps[1].status == "failed"
+
+
+def test_plan_runtime_validation_gate_requires_clean_evidence():
+    plan = AnalysisPlan(
+        goal="统计订单", metrics=["订单数"], steps=[
+            {"id": "query", "title": "查询", "kind": "query"},
+            {"id": "validate", "title": "验证", "kind": "validate"},
+        ]
+    )
+    runtime = PlanRuntime(plan, "统计订单")
+    rejected = runtime.validate_evidence()
+    assert rejected["status"] == "rejected"
+    assert "没有真实查询证据" in rejected["issues"]
+    assert runtime.validation_status == "rejected"
+
+    plan.evidence.append({"source": "query_mysql", "row_count": 1, "quality_issues": []})
+    runtime.validation_status = "pending"
+    approved = runtime.validate_evidence()
+    assert approved["status"] == "approved"
+    assert plan.steps[1].status == "succeeded"
+
+
+def test_plan_runtime_rejects_failed_query_even_without_quality_issue():
+    plan = AnalysisPlan(
+        goal="统计订单", metrics=["订单数"], steps=[
+            {"id": "query", "title": "查询", "kind": "query"},
+            {"id": "validate", "title": "验证", "kind": "validate"},
+        ]
+    )
+    runtime = PlanRuntime(plan, "统计订单")
+    runtime.before_tool("query_mysql", {"sql": "SELECT broken"})
+    runtime.after_tool("query_mysql", {"sql": "SELECT broken"}, "SQL 执行错误：字段不存在")
+    report = runtime.validate_evidence()
+    assert report["status"] == "rejected"
+    assert "数据执行步骤失败" in report["issues"]

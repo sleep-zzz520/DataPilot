@@ -87,4 +87,17 @@ describe('streamChat SSE 解析', () => {
     await streamChat({}, { onDelta })
     expect(onDelta).toHaveBeenCalledWith('跨块')
   })
+
+  it('连接关闭时没有最后空行也能处理 done 帧', async () => {
+    const body = `data: ${JSON.stringify({ type: 'done', session_id: 's1', reply: '完成' })}`
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(body))
+        controller.close()
+      }
+    }), { status: 200 })))
+    const onDone = vi.fn()
+    await streamChat({}, { onDone })
+    expect(onDone).toHaveBeenCalledWith(expect.objectContaining({ reply: '完成' }))
+  })
 })

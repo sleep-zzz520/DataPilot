@@ -1,106 +1,213 @@
-"""多智能体协作（Supervisor 模式）：主管 + 三专家，复用显式图。
+"""P1 分析角色编排：Supervisor + 执行、验证、表达三个角色。
 
-架构（面试可画图讲解）：
-                 ┌──────────────┐
-                 │  supervisor  │  主管 Agent：分派任务 + 汇总回答
-                 └──────┬───────┘
-        ┌───────────────┼───────────────┐
-        ▼               ▼               ▼
-  [sql_expert]    [viz_expert]    [file_expert]
-  list_schemas    make_chart      list_files
-  get_schema      generate_chart  query_file
-  query_mysql     auto_analyze    file_stats
+分析规划器已经由 ``analysis_plan`` StateGraph 在进入本图前执行。本模块只负责：
 
-实现方式：
-- 主管是一个显式图（make_graph），其工具是 3 个"专家入口工具"
-- 每个专家入口工具内部：用专家自己的显式子图（make_graph(llm, expert_tools)）
-  + 专家专用 system prompt 执行任务，返回结果字符串给主管
-- 主管基于用户问题通过工具调用路由；可串联多个专家（如 先查库再画图）
-- 子图共享同一个 llm 实例（bind_tools 各自绑定自己的工具集）
+    Supervisor → data_executor → statistical_validator → insight_writer
+
+Supervisor 只能调用角色入口；验证门禁由 PlanRuntime 确定性执行，避免模型绕过验证
+直接给出数值结论。数据库和文件工具合并到 data_executor，图表工具仅在 insight_writer
+通过验证后可用。
 """
 from __future__ import annotations
 
+import json
 import re
+from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
+from app.agent.analysis_plan import PlanRuntime
 from app.agent.graph import make_graph
 from app.agent.prompts import (
-    SUPERVISOR_PROMPT, SQL_EXPERT_PROMPT, VIZ_EXPERT_PROMPT, FILE_EXPERT_PROMPT,
+    DATA_EXECUTOR_PROMPT,
+    INSIGHT_WRITER_PROMPT,
+    STATISTICAL_VALIDATOR_PROMPT,
+    SUPERVISOR_PROMPT,
 )
 
-# 工具 → 专家分组（按现有工具名划分）
+# 保留工具分组常量，供工具注册和旧调用方复用；角色层不再按 SQL/文件拆专家。
 SQL_TOOL_NAMES = ("list_schemas", "get_schema", "get_table_schema", "query_mysql")
-VIZ_TOOL_NAMES = ("make_chart", "generate_chart", "auto_analyze_and_visualize")
 FILE_TOOL_NAMES = ("list_files", "query_file", "file_stats")
+VIZ_TOOL_NAMES = ("make_chart", "generate_chart", "auto_analyze_and_visualize")
+STAT_TOOL_NAMES = (
+    "compare_periods_tool", "compare_groups_tool", "analyze_trend_tool",
+    "detect_outliers_tool", "analyze_correlation_tool",
+)
+DATA_TOOL_NAMES = SQL_TOOL_NAMES + FILE_TOOL_NAMES
 
-# 专家子图内可能生成的前端标记（图表/表格/图片）：必须原样带回主管层，
-# 否则标记只留在专家子图内部，_extract 提取不到 → 前端无图/无表。
 _MARK_RE = re.compile(r"<!--(?:CHART|TABLE|IMAGE_BASE64):.*?-->", re.S)
 
 
-def _make_expert_tool(name: str, description: str, llm, tools: list, system_prompt: str,
-                      trace=None, plan_runtime=None):
-    """构造专家入口工具：内部用专家的显式子图执行任务，返回结果字符串。"""
-    # 与主管共享同一个 trace 采集器，专家内部工具调用也进入全链路轨迹
-    subgraph = make_graph(llm, tools, trace=trace, agent_name=name, plan_runtime=plan_runtime)
+def _make_role_tool(
+    name: str,
+    description: str,
+    llm,
+    tools: list,
+    system_prompt: str,
+    trace=None,
+    plan_runtime: Optional[PlanRuntime] = None,
+    before=None,
+    after=None,
+):
+    """构造角色入口；角色内部仍是独立显式子图，保留调用链和职责边界。"""
+    subgraph = make_graph(
+        llm, tools, trace=trace, agent_name=name, plan_runtime=plan_runtime
+    )
 
     @tool
-    def expert(request: str) -> str:
-        """(description 由外层注入)"""
+    def role(request: str) -> str:
+        """角色入口。"""
+        if before:
+            blocked = before(request)
+            if blocked:
+                return blocked
         msgs = [SystemMessage(content=system_prompt), HumanMessage(content=request)]
         result = subgraph.invoke({"messages": msgs})
         sub_msgs = result["messages"]
         last = sub_msgs[-1]
         reply = str(getattr(last, "content", None) or "")
-        # 把子图内生成的图表/表格/图片标记全部带回（去重保序），
-        # 供主管层 _extract 提取、前端渲染。
-        marks: list = []
-        for m in sub_msgs:
-            c = str(getattr(m, "content", None) or "")
-            for mk in _MARK_RE.findall(c):
-                if mk not in marks:
-                    marks.append(mk)
+        # 子图内的图表/表格标记必须回传给 Supervisor，供 API 提取和前端渲染。
+        marks: list[str] = []
+        for message in sub_msgs:
+            content = str(getattr(message, "content", None) or "")
+            for mark in _MARK_RE.findall(content):
+                if mark not in marks:
+                    marks.append(mark)
         if marks:
             reply = (reply.rstrip() + "\n" + "\n".join(marks)).strip()
+        if after:
+            reply = after(reply)
         return reply
 
-    expert.name = name
-    return expert
+    role.name = name
+    role.description = description
+    return role
 
 
-def make_agent(llm, all_tools: list, trace=None, plan_runtime=None):
-    """构建多智能体主管图。
+def _make_validator_tool(plan_runtime: Optional[PlanRuntime], llm=None,
+                         statistical_tools: Optional[list] = None, trace=None):
+    """创建统计验证角色：先做确定性门禁，再用 Python 工具完成可复核计算。"""
 
-    - all_tools：全量工具列表（make_tools 产物），按名称分给三个专家
-    - 返回 (graph, supervisor_prompt)：graph 供 chat 调用；prompt 用于构造输入
-    - 若可用专家 ≤1 个（如无上传文件），回退为单 Agent（多智能体无意义）
+    subgraph = None
+    # 直接调用 make_agent 的旧兼容场景没有运行时证据，保留原来的零额外调用行为；
+    # 生产 API 始终传入 PlanRuntime，统计子图在真实证据通过门禁后启用。
+    if plan_runtime is not None and llm is not None and statistical_tools:
+        subgraph = make_graph(
+            llm, statistical_tools, trace=trace, agent_name="statistical_validator"
+        )
+
+    @tool
+    def statistical_validator(request: str) -> str:
+        """检查本轮真实证据、样本量、口径、计算和异常结果。"""
+        if plan_runtime is None:
+            report: dict[str, Any] = {
+                "status": "approved",
+                "evidence_count": 0,
+                "evidence": [],
+                "issues": [],
+                "note": "未提供 PlanRuntime，兼容直接调用场景；生产请求始终启用确定性验证。",
+            }
+        else:
+            report = plan_runtime.validate_evidence()
+        calculation = ""
+        if report["status"] == "approved" and subgraph is not None:
+            result = subgraph.invoke({
+                "messages": [
+                    SystemMessage(content=STATISTICAL_VALIDATOR_PROMPT),
+                    HumanMessage(content=request),
+                ]
+            })
+            messages = result.get("messages") or []
+            if messages:
+                # 不只保留 LLM 的摘要，必须把统计工具的结构化 JSON 一并回传，
+                # 否则 Supervisor 看不到 parameters/sample_size/intermediate/result。
+                tool_outputs = [
+                    str(getattr(message, "content", None) or "")
+                    for message in messages
+                    if getattr(message, "type", "") == "tool"
+                ]
+                final_note = str(getattr(messages[-1], "content", None) or "")
+                calculation = "\n".join(tool_outputs)
+                if final_note and final_note not in calculation:
+                    calculation = (calculation + "\n统计验证说明：" + final_note).strip()
+                calculation_errors = []
+                for output in tool_outputs:
+                    try:
+                        payload = json.loads(output)
+                    except (TypeError, ValueError):
+                        continue
+                    if payload.get("status") == "error":
+                        calculation_errors.append(payload.get("message") or "统计工具返回错误")
+                if calculation_errors:
+                    issue = "统计工具计算失败：" + "；".join(calculation_errors)
+                    if issue not in report["issues"]:
+                        report["issues"].append(issue)
+                    report["status"] = "rejected"
+                    if plan_runtime is not None:
+                        if issue not in plan_runtime.plan.quality_issues:
+                            plan_runtime.plan.quality_issues.append(issue)
+                        plan_runtime.validation_status = "rejected"
+                        plan_runtime.validation_report = dict(report)
+        status = "通过" if report["status"] == "approved" else "不通过"
+        issues = "；".join(report.get("issues") or []) or "未发现已知质量问题"
+        return (
+            f"统计验证：{status}\n"
+            f"证据数：{report.get('evidence_count', 0)}\n"
+            f"检查结果：{issues}\n"
+            f"验证报告：{report}"
+            + (f"\n可复核统计计算：{calculation}" if calculation else "")
+        )
+
+    statistical_validator.name = "statistical_validator"
+    return statistical_validator
+
+
+def make_agent(llm, all_tools: list, trace=None, plan_runtime: Optional[PlanRuntime] = None):
+    """构建 P1 分析角色图，返回 ``(graph, supervisor_prompt)``。
+
+    生产请求始终传入 PlanRuntime，因此 insight_writer 在验证未通过时会被硬阻断。
+    ``all_tools`` 中未被识别的工具仍使用旧的单 Agent 回退，避免影响非分析工具的直接测试。
     """
     by_name = {t.name: t for t in all_tools}
-    sql_tools = [by_name[n] for n in SQL_TOOL_NAMES if n in by_name]
+    data_tools = [by_name[n] for n in DATA_TOOL_NAMES if n in by_name]
     viz_tools = [by_name[n] for n in VIZ_TOOL_NAMES if n in by_name]
-    file_tools = [by_name[n] for n in FILE_TOOL_NAMES if n in by_name]
+    statistical_tools = [by_name[n] for n in STAT_TOOL_NAMES if n in by_name]
 
-    supervisor_tools: list = []
-    if sql_tools:
-        supervisor_tools.append(_make_expert_tool(
-            "sql_expert", "处理所有需要查询 MySQL 数据库的任务（列库、看表结构、执行 SQL 统计/分析）。"
-                          "入参 request 为给专家的完整任务描述。", llm, sql_tools,
-            SQL_EXPERT_PROMPT, trace, plan_runtime))
-    if viz_tools:
-        supervisor_tools.append(_make_expert_tool(
-            "viz_expert", "生成图表/可视化（柱状、折线、饼图等）。数据需先由 sql_expert/file_expert 或用户提供。"
-                          "入参 request 为给专家的完整任务描述（含数据）。", llm, viz_tools,
-                          VIZ_EXPERT_PROMPT, trace, plan_runtime))
-    if file_tools:
-        supervisor_tools.append(_make_expert_tool(
-            "file_expert", "分析用户上传的 CSV/Excel 文件（列、统计、SQL 查询）。"
-                           "入参 request 为给专家的完整任务描述。", llm, file_tools,
-                           FILE_EXPERT_PROMPT, trace, plan_runtime))
+    role_tools: list = []
+    if data_tools:
+        role_tools.append(_make_role_tool(
+            "data_executor",
+            "负责 Schema、MySQL SELECT 和上传文件的真实查询，只返回可复核数据证据。",
+            llm, data_tools, DATA_EXECUTOR_PROMPT, trace, plan_runtime,
+        ))
+    if data_tools or plan_runtime is not None:
+        role_tools.append(_make_validator_tool(
+            plan_runtime, llm=llm, statistical_tools=statistical_tools, trace=trace
+        ))
 
-    if len(supervisor_tools) <= 1:
-        # 专家太少：多智能体没有分派价值，回退单 Agent（全量工具 + 原 system prompt 由调用方决定）
-        return make_graph(llm, all_tools, trace=trace, agent_name="agent", plan_runtime=plan_runtime), SUPERVISOR_PROMPT
+    def require_validation(_request: str) -> Optional[str]:
+        if plan_runtime is not None and plan_runtime.validation_status != "approved":
+            return (
+                "洞察表达已停止：统计验证尚未通过。请先调用 statistical_validator，"
+                "并仅基于通过验证的证据继续。"
+            )
+        return None
 
-    return make_graph(llm, supervisor_tools, trace=trace, agent_name="supervisor", plan_runtime=plan_runtime), SUPERVISOR_PROMPT
+    if viz_tools or plan_runtime is not None:
+        role_tools.append(_make_role_tool(
+            "insight_writer",
+            "基于 statistical_validator 通过的证据生成结论、限制、建议，并按需生成图表。",
+            llm, viz_tools, INSIGHT_WRITER_PROMPT, trace, plan_runtime,
+            before=require_validation,
+        ))
+
+    if not role_tools:
+        # 非分析工具（如单独的测试工具）保留兼容回退；真实分析请求不会走这里。
+        return make_graph(
+            llm, all_tools, trace=trace, agent_name="agent", plan_runtime=plan_runtime
+        ), SUPERVISOR_PROMPT
+
+    return make_graph(
+        llm, role_tools, trace=trace, agent_name="supervisor", plan_runtime=plan_runtime
+    ), SUPERVISOR_PROMPT

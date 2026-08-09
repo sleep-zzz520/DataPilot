@@ -35,7 +35,7 @@ def _filter_new_messages(input_messages: list, result_messages: list) -> list:
 
 
 def make_graph(llm, tools, max_sql_attempts: int = MAX_SQL_ATTEMPTS,
-               trace: "TraceCollector | None" = None, agent_name: str = "agent",
+               trace: Optional["TraceCollector"] = None, agent_name: str = "agent",
                plan_runtime=None):
     """构造显式编排的 Agent 图。签名与 create_react_agent 用法兼容（chat_api 无需改动）。
 

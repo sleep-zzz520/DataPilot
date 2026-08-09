@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, Literal, TypedDict
+from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
@@ -15,40 +15,40 @@ class PlanStep(BaseModel):
     id: str
     title: str
     kind: Literal["discover_source", "load_schema", "query", "calculate", "validate", "visualize", "summarize"]
-    depends_on: list[str] = Field(default_factory=list)
+    depends_on: List[str] = Field(default_factory=list)
     status: Literal["pending", "running", "succeeded", "failed", "skipped"] = "pending"
-    input: dict[str, Any] = Field(default_factory=dict)
-    output: dict[str, Any] | None = None
-    error: str | None = None
+    input: Dict[str, Any] = Field(default_factory=dict)
+    output: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
     retry_count: int = 0
 
 
 class AnalysisPlan(BaseModel):
     goal: str
-    data_sources: list[str] = Field(default_factory=list)
-    metrics: list[Any] = Field(default_factory=list)
-    dimensions: list[str] = Field(default_factory=list)
-    filters: list[str] = Field(default_factory=list)
-    time_range: str | None = None
-    grain: str | None = None
-    sort: str | None = None
-    unit: str | None = None
-    steps: list[PlanStep] = Field(default_factory=list)
+    data_sources: List[str] = Field(default_factory=list)
+    metrics: List[Any] = Field(default_factory=list)
+    dimensions: List[str] = Field(default_factory=list)
+    filters: List[str] = Field(default_factory=list)
+    time_range: Optional[str] = None
+    grain: Optional[str] = None
+    sort: Optional[str] = None
+    unit: Optional[str] = None
+    steps: List[PlanStep] = Field(default_factory=list)
     output_format: Literal["text", "table", "chart", "report"] = "text"
-    assumptions: list[str] = Field(default_factory=list)
+    assumptions: List[str] = Field(default_factory=list)
     clarification_needed: bool = False
-    clarification_question: str | None = None
+    clarification_question: Optional[str] = None
     version: int = 1
-    error: str | None = None
-    quality_issues: list[str] = Field(default_factory=list)
-    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    error: Optional[str] = None
+    quality_issues: List[str] = Field(default_factory=list)
+    evidence: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class AnalysisState(TypedDict):
     question: str
-    catalog: list[dict]
-    plan: AnalysisPlan | None
-    error: str | None
+    catalog: List[dict]
+    plan: Optional[AnalysisPlan]
+    error: Optional[str]
 
 
 _PLAN_PROMPT = """你是企业数据分析规划器。请只输出 JSON，不要 Markdown。
@@ -75,7 +75,7 @@ def _extract_json(content: str) -> dict:
     return json.loads(match.group(0))
 
 
-def _fallback_plan(question: str, catalog: list[dict], error: str | None = None) -> AnalysisPlan:
+def _fallback_plan(question: str, catalog: List[dict], error: Optional[str] = None) -> AnalysisPlan:
     """规划失败时仍返回可展示计划，主 Agent 可以沿用现有流程继续处理。"""
     sources = [item["name"] for item in catalog[:3] if item.get("name")]
     return AnalysisPlan(
@@ -136,8 +136,10 @@ class PlanRuntime:
         self.plan = plan
         self.question = question
         self.on_update = on_update
-        self._current: PlanStep | None = None
+        self._current: Optional[PlanStep] = None
         self._query_seen = False
+        self.validation_status = "pending"
+        self.validation_report: dict[str, Any] = {}
 
     def _emit(self):
         if self.on_update:
@@ -146,11 +148,14 @@ class PlanRuntime:
     def snapshot(self) -> dict:
         return self.plan.model_dump(exclude_none=True)
 
-    def _step_for(self, tool: str) -> PlanStep | None:
+    def _step_for(self, tool: str) -> Optional[PlanStep]:
         kinds = {
             "list_schemas": "discover_source", "get_schema": "load_schema",
             "get_table_schema": "load_schema", "query_mysql": "query",
             "query_file": "query", "file_stats": "query",
+            "compare_periods_tool": "calculate", "compare_groups_tool": "calculate",
+            "analyze_trend_tool": "calculate", "detect_outliers_tool": "calculate",
+            "analyze_correlation_tool": "calculate",
             "make_chart": "visualize", "generate_chart": "visualize",
             "auto_analyze_and_visualize": "visualize",
         }
@@ -173,7 +178,7 @@ class PlanRuntime:
             self._emit()
 
     @staticmethod
-    def _table_payload(result: str) -> dict | None:
+    def _table_payload(result: str) -> Optional[dict]:
         match = re.search(r"<!--TABLE:(.*?)-->", result or "", re.S)
         if not match:
             return None
@@ -183,7 +188,7 @@ class PlanRuntime:
             return None
 
     def after_tool(self, tool: str, args: dict, result: str) -> list[str]:
-        issues: list[str] = []
+        issues: List[str] = []
         failed = "错误" in (result or "") or "异常" in (result or "")
         payload = self._table_payload(result)
         if tool in ("query_mysql", "query_file"):
@@ -240,13 +245,42 @@ class PlanRuntime:
         for issue in issues:
             if issue not in self.plan.quality_issues:
                 self.plan.quality_issues.append(issue)
+        if tool in ("query_mysql", "query_file"):
+            self.validation_status = "pending"
         if issues:
             self._emit()
         return issues
 
+    def validate_evidence(self) -> Dict[str, Any]:
+        """执行洞察前的确定性门禁，避免验证依赖 LLM 自己宣称通过。"""
+        reasons = list(dict.fromkeys(self.plan.quality_issues))
+        if not self.plan.evidence:
+            reasons.insert(0, "没有真实查询证据")
+        if any(step.kind == "query" and step.status == "failed" for step in self.plan.steps):
+            reasons.append("数据执行步骤失败")
+        reasons = list(dict.fromkeys(reasons))
+        approved = not reasons
+        self.validation_status = "approved" if approved else "rejected"
+        self.validation_report = {
+            "status": self.validation_status,
+            "evidence_count": len(self.plan.evidence),
+            "evidence": list(self.plan.evidence),
+            "issues": reasons,
+        }
+        for step in self.plan.steps:
+            if step.kind == "validate" and step.status != "succeeded":
+                step.status = "succeeded" if approved else "failed"
+                step.output = {"quality_issues": reasons}
+                step.error = "；".join(reasons) if reasons else None
+        self._emit()
+        return dict(self.validation_report)
+
     def finalize(self):
         for step in self.plan.steps:
-            if step.status == "pending" and step.kind in ("validate", "summarize"):
-                step.status = "failed" if self.plan.quality_issues else "succeeded"
+            if step.status == "pending" and step.kind == "validate":
+                step.status = "succeeded" if self.validation_status == "approved" else "failed"
+                step.output = {"quality_issues": list(self.plan.quality_issues)}
+            if step.status == "pending" and step.kind == "summarize":
+                step.status = "succeeded" if self.validation_status == "approved" else "failed"
                 step.output = {"quality_issues": list(self.plan.quality_issues)}
         self._emit()

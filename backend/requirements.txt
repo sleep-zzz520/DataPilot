@@ -1,15 +1,15 @@
 # 基础依赖
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-sqlalchemy>=2.0.0
+fastapi>=0.104.0,<1.0
+uvicorn[standard]>=0.24.0,<1.0
+sqlalchemy>=2.0.0,<3.0
 pymysql>=1.1.0
-pandas>=2.0.0
-numpy>=1.24.0
-langchain>=0.0.300
-langchain-openai>=0.0.5
-langchain-anthropic>=0.3.0
-langgraph>=0.0.20
-pydantic>=2.0.0
+pandas>=2.0.0,<3.0
+numpy>=1.24.0,<3.0
+langchain>=0.0.300,<1.0
+langchain-openai>=0.0.5,<1.0
+langchain-anthropic>=0.3.0,<1.0
+langgraph>=0.0.20,<1.0
+pydantic>=2.0.0,<3.0
 duckdb>=1.0.0  # 上传文件 SQL 查询
 pyjwt>=2.8.0   # 用户认证 JWT
 

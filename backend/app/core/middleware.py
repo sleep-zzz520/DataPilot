@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import time
+from typing import Optional
 
 from app.core.metrics import metrics
 from app.core.logging import get_logger
@@ -24,7 +25,7 @@ class ObservabilityMiddleware:
             return await self.app(scope, receive, send)
 
         start = time.perf_counter()
-        status: int | None = None
+        status: Optional[int] = None
 
         async def wrapped_send(message):
             nonlocal status

@@ -3,8 +3,8 @@ import { mount } from '@vue/test-utils'
 import AgentTrace from './AgentTrace.vue'
 
 const entries = [
-  { seq: 1, agent: 'supervisor', tool: 'sql_expert', depth: 0, input: '{"request":"查订单"}', output: '完成', status: 'ok', duration_ms: 120 },
-  { seq: 2, agent: 'sql_expert', tool: 'query_mysql', depth: 1, input: '{"sql":"SELECT 1"}', output: '1 行', status: 'error', duration_ms: 30 }
+  { seq: 1, agent: 'supervisor', tool: 'data_executor', depth: 0, input: '{"request":"查订单"}', output: '完成', status: 'ok', duration_ms: 120 },
+  { seq: 2, agent: 'data_executor', tool: 'query_mysql', depth: 1, input: '{"sql":"SELECT 1"}', output: '1 行', status: 'error', duration_ms: 30 }
 ]
 
 describe('AgentTrace', () => {
@@ -17,10 +17,10 @@ describe('AgentTrace', () => {
     const w = mount(AgentTrace, { props: { entries } })
     expect(w.text()).toContain('Agent 调用轨迹')
     expect(w.text()).toContain('2 步')
-    expect(w.text()).toContain('sql_expert')
+    expect(w.text()).toContain('data_executor')
     expect(w.text()).toContain('query_mysql')
     expect(w.text()).toContain('主管')
-    expect(w.text()).toContain('SQL 专家')
+    expect(w.text()).toContain('数据执行')
     expect(w.text()).toContain('成功')
     expect(w.text()).toContain('失败')
     expect(w.text()).toContain('120ms')

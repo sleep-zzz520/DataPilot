@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from threading import Lock
 from copy import deepcopy
+from typing import Optional
 from app.meta import crypto
 
 # 用 __file__ 推导绝对路径，避免从不同工作目录启动时配置分裂
@@ -70,13 +71,13 @@ def list_llm_configs() -> list[dict]:
         items = _load_and_migrate(_LLM_FILE, _migrate_llm)
         return [_llm_view(it) for it in items]
 
-def get_llm_config(cfg_id: int) -> dict | None:
+def get_llm_config(cfg_id: int) -> Optional[dict]:
     with _lock:
         items = _load_and_migrate(_LLM_FILE, _migrate_llm)
         it = next((x for x in items if x.get("id") == cfg_id), None)
         return _llm_view(it) if it else None
 
-def get_llm_secret(cfg_id: int) -> dict | None:
+def get_llm_secret(cfg_id: int) -> Optional[dict]:
     """返回含真实 api_key 的完整配置（仅内部使用，不暴露给前端）"""
     with _lock:
         items = _load_and_migrate(_LLM_FILE, _migrate_llm)
@@ -120,13 +121,13 @@ def list_db_configs() -> list[dict]:
         items = _load_and_migrate(_DB_FILE, _migrate_db)
         return [_db_view(it) for it in items]
 
-def get_db_config(cfg_id: int) -> dict | None:
+def get_db_config(cfg_id: int) -> Optional[dict]:
     with _lock:
         items = _load_and_migrate(_DB_FILE, _migrate_db)
         it = next((x for x in items if x.get("id") == cfg_id), None)
         return _db_view(it) if it else None
 
-def get_db_secret(cfg_id: int) -> dict | None:
+def get_db_secret(cfg_id: int) -> Optional[dict]:
     """返回含真实 password 的完整配置（仅内部使用）"""
     with _lock:
         items = _load_and_migrate(_DB_FILE, _migrate_db)

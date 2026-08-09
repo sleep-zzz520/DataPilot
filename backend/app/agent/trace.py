@@ -5,15 +5,16 @@
     不需要侵入任何工具实现。主管图与专家子图共享同一个 TraceCollector，
     通过 begin/end 的栈深度得到调用层级，一轮对话即可还原完整链路：
 
-        seq=1  supervisor   sql_expert        (depth 0)
-        seq=2  sql_expert   query_mysql       (depth 1)
-        seq=3  sql_expert   get_schema        (depth 1)
-        seq=4  supervisor   viz_expert        (depth 0)
+        seq=1  supervisor   data_executor     (depth 0)
+        seq=2  data_executor query_mysql      (depth 1)
+        seq=3  data_executor get_schema       (depth 1)
+        seq=4  supervisor   insight_writer    (depth 0)
         ...
 
 每条 entry：
     seq          全局序号（前端时间线排序）
-    agent        发起调用的 Agent（supervisor / sql_expert / viz_expert / file_expert / agent）
+    agent        发起调用的 Agent（supervisor / data_executor / statistical_validator /
+                 insight_writer / agent）
     tool         工具名
     depth        调用层级（0 = 主管直接调用；专家内部工具 = 1）
     input        入参摘要（截断为单行）

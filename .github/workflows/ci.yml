@@ -28,6 +28,9 @@ jobs:
       - name: 模块导入检查
         run: python -c "from app.main import app; assert app.title"
 
+      - name: Python 3.9 类型注解与工具 schema 检查
+        run: python -c "from app.agent.analysis_plan import AnalysisPlan; from app.tools.statistical_tool import make_statistical_tools; AnalysisPlan(goal='兼容性检查').model_json_schema(); assert len(make_statistical_tools()) == 5"
+
       - name: pytest 单测（核心逻辑）
         run: python -m pytest tests/
 

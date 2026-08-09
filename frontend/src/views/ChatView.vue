@@ -433,6 +433,7 @@ async function send() {
   pending.push(userMsg, assistantMsg)
   pendingMsgs.value.set(store.sessionId, pending)
   streamingActive.value = false
+  let streamError = false
   try {
     await chatApi.streamChat(
       {
@@ -483,6 +484,7 @@ async function send() {
           if (!msg.text.trim()) msg.text = res.reply || '(无文本回复)'
         },
         onError: (err) => {
+          streamError = true
           if (store.sessionId === sidAtSend) {
             const target = messages.value.find(m => m._key === assistantMsg._key)
             if (target) target.error = err
@@ -490,8 +492,12 @@ async function send() {
         }
       }
     )
-    // 发送成功：后端已落库，清掉本地缓存（避免切回后重复）
+    // 后端在 done 前已完成持久化；重新加载一次当前会话，确保大响应、
+    // 代理截断或 SSE done 丢失时，最终消息也能立即进入当前视图。
     pendingMsgs.value.delete(sidAtSend)
+    if (!streamError && store.sessionId === sidAtSend) {
+      await loadSession(sidAtSend, true)
+    }
     // 发送成功后刷新会话列表(标题/时间可能更新)
     await refreshSessions()
   } catch (err) {

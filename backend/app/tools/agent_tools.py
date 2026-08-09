@@ -4,6 +4,7 @@ from langchain_core.tools import tool
 from app.db.schema import list_business_schemas, get_schema_text, get_table_schema_text
 from app.tools.chart_tool import get_chart_tools
 from app.tools.file_tool import make_file_tools
+from app.tools.statistical_tool import make_statistical_tools
 
 _FORBIDDEN = re.compile(r"\b(drop|delete|update|insert|alter|truncate|create|grant|revoke)\b", re.I)
 _BARE_DASH = re.compile(r"(?<!`)(share-[A-Za-z0-9_]+)(?!`)")
@@ -103,5 +104,7 @@ def make_tools(engine, default_schema=None, files=None, audit_ctx=None):
 
     # 上传文件分析工具（有文件时才注册）
     file_tools = make_file_tools(files or {}, audit_ctx=ctx)
+    # 统计工具只由 statistical_validator 子图使用；LLM 选择方法，Python/numpy 计算数值。
+    statistical_tools = make_statistical_tools()
 
-    return [list_schemas, get_schema, get_table_schema, query_mysql, make_chart] + chart_tools + file_tools
+    return [list_schemas, get_schema, get_table_schema, query_mysql, make_chart] + chart_tools + file_tools + statistical_tools
