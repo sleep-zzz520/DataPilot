@@ -4,6 +4,8 @@ import json
 import pandas as pd
 import pytest
 
+from app.core.process_executor import LocalToolTimeoutError
+from app.tools import file_tool
 from app.tools.file_tool import make_file_tools, _to_md
 
 
@@ -104,3 +106,32 @@ def test_query_file_compresses_long_output():
     assert "已省略" in out
     machine = json.loads(out.split("<!--TABLE:")[1].rstrip("-->"))
     assert len(machine["rows"]) == 200  # 前端表格仍完整
+
+
+def test_query_file_uses_isolated_process_for_persisted_upload(tmp_path):
+    path = tmp_path / "scores.csv"
+    _sample_df().to_csv(path, index=False)
+    tools = {item.name: item for item in make_file_tools(
+        {"成绩.csv": _sample_df()},
+        file_paths={"成绩.csv": str(path)},
+    )}
+
+    out = tools["query_file"].invoke({"file": "成绩.csv", "sql": "SELECT 科目, 分数 FROM df"})
+
+    assert "语文" in out and "<!--TABLE:" in out
+
+
+def test_query_file_process_timeout_is_machine_readable(monkeypatch, tmp_path):
+    def timeout(*_args, **_kwargs):
+        raise LocalToolTimeoutError("too slow")
+
+    monkeypatch.setattr(file_tool, "run_in_process", timeout)
+    path = tmp_path / "scores.csv"
+    _sample_df().to_csv(path, index=False)
+    tools = {item.name: item for item in make_file_tools(
+        {"成绩.csv": _sample_df()},
+        file_paths={"成绩.csv": str(path)},
+    )}
+
+    out = tools["query_file"].invoke({"file": "成绩.csv", "sql": "SELECT * FROM df"})
+    assert out.startswith("[TOOL_TIMEOUT] query_file")

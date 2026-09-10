@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from app.tools.agent_tools import make_tools, _to_md
+from app.core.timeouts import MYSQL_MAX_EXECUTION_TIME_MS
 
 
 def _q(sql: str):
@@ -71,6 +72,75 @@ def test_query_mysql_sql_error_friendly(monkeypatch):
     monkeypatch.setattr(pd, "read_sql", boom)
     out = _q("SELECT * FROM t")
     assert "SQL 执行错误" in out and "syntax error" in out
+
+
+def test_query_mysql_sets_mysql_server_execution_timeout(monkeypatch):
+    seen = {}
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def exec_driver_sql(self, statement):
+            seen["statement"] = statement
+
+    class Engine:
+        def connect(self):
+            return Connection()
+
+    def fake_read_sql(sql, conn):
+        seen["connection"] = conn
+        return _df()
+
+    monkeypatch.setattr(pd, "read_sql", fake_read_sql)
+    tools = {t.name: t for t in make_tools(engine=Engine())}
+    tools["query_mysql"].invoke({"sql": "SELECT * FROM t"})
+
+    assert seen["statement"] == f"SET SESSION max_execution_time = {MYSQL_MAX_EXECUTION_TIME_MS}"
+    assert isinstance(seen["connection"], Connection)
+
+
+def test_query_mysql_timeout_has_machine_readable_marker(monkeypatch):
+    def timeout(*_args):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(pd, "read_sql", timeout)
+    out = _q("SELECT * FROM t")
+    assert out.startswith("[TOOL_TIMEOUT] query_mysql")
+
+
+def test_query_mysql_invalidates_timed_out_connection(monkeypatch):
+    seen = {"invalidated": None}
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def exec_driver_sql(self, _statement):
+            return None
+
+        def invalidate(self, exc):
+            seen["invalidated"] = exc
+
+    class Engine:
+        def connect(self):
+            return Connection()
+
+    def timeout(*_args):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(pd, "read_sql", timeout)
+    tools = {t.name: t for t in make_tools(engine=Engine())}
+    out = tools["query_mysql"].invoke({"sql": "SELECT * FROM t"})
+
+    assert out.startswith("[TOOL_TIMEOUT]")
+    assert isinstance(seen["invalidated"], TimeoutError)
 
 
 # ── make_chart 工具 ───────────────────────────────────────────────────────────

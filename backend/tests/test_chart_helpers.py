@@ -2,7 +2,9 @@
 import pandas as pd
 import pytest
 
-from app.tools.chart_tool import _validate_data, _auto_select_chart_type
+from app.core.process_executor import LocalToolTimeoutError
+from app.tools import chart_tool
+from app.tools.chart_tool import _validate_data, _auto_select_chart_type, generate_chart
 
 
 # ── 数据校验 ──────────────────────────────────────────────────────────────────
@@ -56,3 +58,25 @@ def test_auto_select_category_plus_numeric_few_pie():
 def test_auto_select_single_numeric_histogram():
     df = pd.DataFrame({"val": [1, 2, 3]})
     assert _auto_select_chart_type(df, "auto") == "histogram"
+
+
+def test_generate_chart_runs_in_isolated_process():
+    out = generate_chart.invoke({
+        "chart_type": "bar",
+        "title": "城市销量",
+        "data": [{"城市": "北京", "销量": 1}, {"城市": "上海", "销量": 2}],
+    })
+    assert "<!--CHART:" in out and "<!--IMAGE_BASE64:" in out
+
+
+def test_generate_chart_process_timeout_is_machine_readable(monkeypatch):
+    def timeout(*_args, **_kwargs):
+        raise LocalToolTimeoutError("too slow")
+
+    monkeypatch.setattr(chart_tool, "run_in_process", timeout)
+    out = generate_chart.invoke({
+        "chart_type": "bar",
+        "title": "城市销量",
+        "data": [{"城市": "北京", "销量": 1}],
+    })
+    assert out.startswith("[TOOL_TIMEOUT] generate_chart")

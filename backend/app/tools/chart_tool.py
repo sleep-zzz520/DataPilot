@@ -48,6 +48,8 @@ except ImportError:
 
 # LangChain tool 装饰器
 from langchain_core.tools import tool
+from app.core.process_executor import LocalToolProcessError, LocalToolTimeoutError, run_in_process
+from app.core.timeouts import LOCAL_TOOL_TIMEOUT_SECONDS
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━────────────
@@ -427,8 +429,7 @@ CHART_GENERATORS = {
 }
 
 
-@tool
-def generate_chart(
+def _generate_chart_payload(
     chart_type: str,
     title: str,
     data: List[Dict],
@@ -522,8 +523,7 @@ def generate_chart(
         return f"❌ 图表生成失败：{str(e)}\n请检查数据格式和参数设置。"
 
 
-@tool
-def auto_analyze_and_visualize(data: List[Dict], intent: str = "auto") -> str:
+def _auto_analyze_and_visualize_payload(data: List[Dict], intent: str = "auto") -> str:
     """
     🤖 智能可视化 - 自动分析数据并选择最佳图表类型
     
@@ -592,6 +592,56 @@ def auto_analyze_and_visualize(data: List[Dict], intent: str = "auto") -> str:
         
     except Exception as e:
         return f"❌ 智能分析失败：{str(e)}"
+
+
+def _run_chart_process(operation: str, fn, *args, **kwargs) -> str:
+    try:
+        return run_in_process(
+            fn,
+            *args,
+            timeout_seconds=LOCAL_TOOL_TIMEOUT_SECONDS,
+            **kwargs,
+        )
+    except LocalToolTimeoutError:
+        return (
+            f"[TOOL_TIMEOUT] {operation} 本地图表生成超时。"
+            "请减少数据量、简化图表类型后重试。"
+        )
+    except LocalToolProcessError as exc:
+        return f"❌ 图表生成进程异常：{exc}"
+
+
+@tool
+def generate_chart(
+    chart_type: str,
+    title: str,
+    data: List[Dict],
+    x_column: Optional[str] = None,
+    y_column: Optional[str] = None,
+    **kwargs
+) -> str:
+    """生成高质量静态图表（独立进程执行，超时自动回收）。"""
+    return _run_chart_process(
+        "generate_chart",
+        _generate_chart_payload,
+        chart_type,
+        title,
+        data,
+        x_column,
+        y_column,
+        **kwargs,
+    )
+
+
+@tool
+def auto_analyze_and_visualize(data: List[Dict], intent: str = "auto") -> str:
+    """自动选择图表类型并生成静态图（独立进程执行，超时自动回收）。"""
+    return _run_chart_process(
+        "auto_analyze_and_visualize",
+        _auto_analyze_and_visualize_payload,
+        data,
+        intent,
+    )
 
 
 # 导出工具列表

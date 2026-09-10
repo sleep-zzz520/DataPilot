@@ -151,6 +151,40 @@ def test_graph_trace_tool_exception_error():
     assert e["status"] == "error" and "爆炸了" in e["output"]
 
 
+def test_graph_trace_tool_timeout_status():
+    @tool
+    def timed_out_tool() -> str:
+        """返回工具层超时标记。"""
+        return "[TOOL_TIMEOUT] timed_out_tool 超时"
+
+    llm = FakeLLM(responses=[
+        _tool_call("timed_out_tool", {}),
+        _answer("工具超时"),
+    ])
+    c = TraceCollector()
+    graph = make_graph(llm, tools=[timed_out_tool], trace=c)
+    graph.invoke({"messages": [HumanMessage(content="x")]})
+
+    assert c.entries[0]["status"] == "timeout"
+
+
+def test_graph_trace_worker_busy_status():
+    @tool
+    def busy_worker() -> str:
+        """返回 Worker 资源繁忙标记。"""
+        return "[WORKER_BUSY] busy_worker 当前资源繁忙"
+
+    llm = FakeLLM(responses=[
+        _tool_call("busy_worker", {}),
+        _answer("稍后重试"),
+    ])
+    c = TraceCollector()
+    graph = make_graph(llm, tools=[busy_worker], trace=c)
+    graph.invoke({"messages": [HumanMessage(content="x")]})
+
+    assert c.entries[0]["status"] == "busy"
+
+
 # ── 流式：astream 期间增量产出轨迹（SSE trace 事件的核心逻辑）────────────────
 def test_astream_emits_trace_deltas():
     llm = FakeLLM(responses=[

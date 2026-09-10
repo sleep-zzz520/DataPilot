@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
 
 vi.mock('../api/config.js', () => ({
@@ -7,7 +7,7 @@ vi.mock('../api/config.js', () => ({
 }))
 
 import * as cfgApi from '../api/config.js'
-import { useConfigStore } from './config.js'
+import { createSessionId, useConfigStore } from './config.js'
 
 const SID_KEY = 'da_session_id'
 
@@ -16,6 +16,17 @@ describe('config store', () => {
     localStorage.clear()
     vi.clearAllMocks()
     setActivePinia(createPinia())
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('HTTP 环境缺少 randomUUID 时仍生成标准 UUID 会话 ID', () => {
+    vi.stubGlobal('crypto', {
+      getRandomValues: (bytes) => bytes.fill(0)
+    })
+    expect(createSessionId()).toBe('00000000-0000-4000-8000-000000000000')
   })
 
   it('loadAll 填充列表并选中默认配置', async () => {

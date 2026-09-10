@@ -61,8 +61,11 @@ def test_llm_context_too_long():
 
 
 def test_llm_network():
-    assert _code_of(classify_llm_error(_Err("ConnectTimeoutError: timed out"))) == "LLM_NETWORK"
     assert _code_of(classify_llm_error(_Err("Connection refused"))) == "LLM_NETWORK"
+
+
+def test_llm_timeout_has_dedicated_code():
+    assert _code_of(classify_llm_error(_Err("ReadTimeout: timed out"))) == "LLM_TIMEOUT"
 
 
 def test_llm_unknown():
@@ -74,6 +77,11 @@ def test_llm_unknown():
 # ── DB 错误 ───────────────────────────────────────────────────────────────────
 def test_db_connect():
     assert _code_of(classify_db_error(_Err(orig=Exception(2003, "Can't connect")))) == "DB_CONNECT"
+
+
+def test_db_server_timeout_has_dedicated_code():
+    error = _Err(orig=Exception(3024, "maximum statement execution time exceeded"))
+    assert _code_of(classify_db_error(error)) == "DB_TIMEOUT"
 
 
 def test_db_auth():

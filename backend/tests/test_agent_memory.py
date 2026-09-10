@@ -19,6 +19,7 @@ from app.persistence import persist_messages
 class FakeLLM(BaseChatModel):
     """按调用顺序返回预设回复。"""
     responses: list = []
+    calls: list = []
     _i: int = 0
 
     @property
@@ -29,6 +30,7 @@ class FakeLLM(BaseChatModel):
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        self.calls.append(list(messages))
         r = self.responses[min(self._i, len(self.responses) - 1)]
         self._i += 1
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=r))])
@@ -67,6 +69,18 @@ def test_extract_skips_without_signal(isolated_storage):
 def test_extract_bad_json_ignored(isolated_storage):
     llm = FakeLLM(responses=["这不是 JSON"])
     assert extract_and_store_memories(llm, 1, "alice", "s1", "我常用 share-order 库", "好的") == 0
+
+
+def test_memory_maintenance_requests_include_user_message(isolated_storage):
+    """兼容要求至少一条 user 消息的 OpenAI 兼容模型（如 GLM）。"""
+    llm = FakeLLM(responses=['[{"key": "图表偏好", "value": "折线图"}]', "订单趋势摘要"])
+
+    assert extract_and_store_memories(llm, 1, "alice", "s1", "我默认用折线图", "好的") == 1
+    assert [type(message) for message in llm.calls[0]] == [SystemMessage, HumanMessage]
+
+    persist_messages("s1", [HumanMessage(content="查询订单趋势")], user_id=1)
+    assert generate_summary(llm, "s1", [HumanMessage(content="查询订单趋势")]) == "订单趋势摘要"
+    assert [type(message) for message in llm.calls[1]] == [SystemMessage, HumanMessage]
 
 
 # ── 长期记忆存取 ──────────────────────────────────────────────────────────────

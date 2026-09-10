@@ -1,5 +1,7 @@
 """显式 Agent 图编排（agent/graph.py）单测：节点流转/工具执行/反思终结/流式兼容。"""
 import asyncio
+import time
+from threading import Event
 
 import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -73,6 +75,28 @@ def test_no_tool_call_ends_directly():
     assert len(msgs) == 2  # input + 回答，无工具中间消息
     new = _filter_new_messages([HumanMessage(content="hi")], msgs)
     assert [m.content for m in new] == ["你好！"]
+
+
+def test_cancelled_graph_does_not_start_llm_tool_calls():
+    llm = FakeLLM(responses=[_tool_call("add", {"a": 1, "b": 2})])
+    cancel_event = Event()
+    cancel_event.set()
+    graph = make_graph(llm, tools=[add], cancel_event=cancel_event)
+
+    result = graph.invoke({"messages": [HumanMessage(content="1+2=?")]})
+
+    assert "执行已取消" in result["messages"][-1].content
+    assert not any(isinstance(message, ToolMessage) for message in result["messages"])
+
+
+def test_expired_deadline_does_not_start_llm_or_tool_calls():
+    llm = FakeLLM(responses=[_tool_call("add", {"a": 1, "b": 2})])
+    graph = make_graph(llm, tools=[add], deadline=time.monotonic() - 0.01)
+
+    result = graph.invoke({"messages": [HumanMessage(content="1+2=?")]})
+
+    assert "执行已取消" in result["messages"][-1].content
+    assert llm._i == 0
 
 
 def test_tool_call_flow_executes_tool():

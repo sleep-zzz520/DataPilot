@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Optional
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from app import persistence
 
@@ -101,7 +101,12 @@ def extract_and_store_memories(llm, user_id: int, username: Optional[str],
     from app.agent.prompts import MEMORY_EXTRACT_PROMPT
     prompt = MEMORY_EXTRACT_PROMPT.format(user_text=(user_text or "")[:800], reply=(reply or "")[:500])
     try:
-        out = llm.invoke([SystemMessage(content=prompt)]).content
+        # GLM 等 OpenAI 兼容服务要求消息列表中至少有一条 user 消息；
+        # 原提示词保持在 system 中，避免改变提取规则和待提取内容。
+        out = llm.invoke([
+            SystemMessage(content=prompt),
+            HumanMessage(content="请严格按上述要求输出结果。"),
+        ]).content
     except Exception:  # noqa: BLE001 —— 记忆提取失败不影响主流程
         return 0
     try:
@@ -182,7 +187,10 @@ def generate_summary(llm, session_id: str, history_messages: list) -> Optional[s
     if not text.strip():
         return None
     try:
-        summary = str(llm.invoke([SystemMessage(content=SUMMARY_PROMPT.format(history=text[:3000]))]).content).strip()
+        summary = str(llm.invoke([
+            SystemMessage(content=SUMMARY_PROMPT.format(history=text[:3000])),
+            HumanMessage(content="请严格按上述要求输出摘要。"),
+        ]).content).strip()
     except Exception:  # noqa: BLE001
         return None
     if not summary:

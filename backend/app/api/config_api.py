@@ -150,13 +150,14 @@ def test_llm(req: LLMConfigSave, user: dict = Depends(get_current_user)):
 def test_db(req: DBConfigSave, user: dict = Depends(get_current_user)):
     """测试连接用真实 password"""
     from sqlalchemy import create_engine, text
+    from app.core.factories import mysql_engine_options
     password = req.password
     if req.id and password and "****" in password:
         secret = store.get_db_secret(req.id)
         password = secret["password"] if secret else password
     uri = f"{req.db_type}+pymysql://{req.username}:{password}@{req.host}:{req.port}/?charset={req.charset}"
     try:
-        engine = create_engine(uri, pool_pre_ping=True)
+        engine = create_engine(uri, **mysql_engine_options())
         with engine.connect() as conn: conn.execute(text("SELECT 1"))
         return {"ok": True}
     except Exception as e:

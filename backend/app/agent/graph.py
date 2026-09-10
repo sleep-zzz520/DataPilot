@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import time
+from threading import Event
 from typing import Annotated, Literal, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
@@ -36,7 +38,8 @@ def _filter_new_messages(input_messages: list, result_messages: list) -> list:
 
 def make_graph(llm, tools, max_sql_attempts: int = MAX_SQL_ATTEMPTS,
                trace: Optional["TraceCollector"] = None, agent_name: str = "agent",
-               plan_runtime=None):
+               plan_runtime=None, cancel_event: Optional[Event] = None,
+               deadline: Optional[float] = None):
     """构造显式编排的 Agent 图。签名与 create_react_agent 用法兼容（chat_api 无需改动）。
 
     trace：可选轨迹采集器（多智能体模式下主管/专家共享同一个，
@@ -46,53 +49,82 @@ def make_graph(llm, tools, max_sql_attempts: int = MAX_SQL_ATTEMPTS,
     tool_map = {t.name: t for t in tools}
     bound_model = llm.bind_tools(tools)
 
+    def cancelled() -> bool:
+        return (cancel_event is not None and cancel_event.is_set()) or (
+            deadline is not None and time.monotonic() >= deadline
+        )
+
     # ── 节点 1：agent（LLM 决策，逐 token 流式）─────────────────────────────
     # 注意：必须把 graph 的 config 传给模型调用，langgraph 才能捕获 token
     # 事件（stream_mode="messages" → SSE 逐字打字机）；不传则一次性输出。
     def agent_node(state: AgentState, config) -> dict:
+        if cancelled():
+            return {"messages": [AIMessage(content="执行已取消：Worker 已超时。")]}
         chunks = list(bound_model.stream(state["messages"], config))
         if not chunks:
             return {"messages": [AIMessage(content="")]}
         merged = chunks[0]
         for c in chunks[1:]:
             merged = merged + c
+        if cancelled():
+            return {"messages": [AIMessage(content="执行已取消：Worker 已超时。")]}
         # AIMessageChunk 是 AIMessage 子类，直接入状态（tool_calls 原样保留）
         return {"messages": [merged]}
 
     # ── 节点 2：tools（执行工具调用 + 轻量反思）──────────────────────────────
     def tools_node(state: AgentState) -> dict:
+        if cancelled():
+            return {
+                "messages": [AIMessage(content="执行已取消：Worker 已超时。")],
+                "sql_attempts": int(state.get("sql_attempts", 0)),
+            }
         last = state["messages"][-1]
         tool_calls = getattr(last, "tool_calls", None) or []
         outs: list = []
         for tc in tool_calls:
-            fn = tool_map.get(tc.get("name"))
+            if cancelled():
+                break
+            tool_name = tc.get("name") or "?"
+            # Supervisor 的角色入口内部还有一层子图；计划步骤只应记录子图里的真实工具。
+            is_worker_entry = agent_name == "supervisor" and tool_name in {
+                "data_executor", "statistical_validator", "insight_writer"
+            }
+            fn = tool_map.get(tool_name)
             entry = None
-            if plan_runtime is not None:
-                plan_runtime.before_tool(tc.get("name") or "?", tc.get("args") or {})
+            if plan_runtime is not None and not is_worker_entry:
+                plan_runtime.before_tool(tool_name, tc.get("args") or {})
             if trace is not None:
-                entry = trace.begin(agent_name, tc.get("name") or "?",
+                entry = trace.begin(agent_name, tool_name,
                                     tc.get("args") or {})
             if fn is None:
                 outs.append(ToolMessage(
-                    content=f"错误：未知工具「{tc.get('name')}」，请使用可用工具。",
-                    tool_call_id=tc.get("id", ""), name=tc.get("name")))
+                    content=f"错误：未知工具「{tool_name}」，请使用可用工具。",
+                    tool_call_id=tc.get("id", ""), name=tool_name))
                 if entry is not None:
                     trace.end(entry, "错误：未知工具", status="error")
                 continue
             try:
                 result = fn.invoke(tc.get("args") or {})
                 result_text = str(result)
-                issues = plan_runtime.after_tool(tc.get("name") or "?", tc.get("args") or {}, result_text) if plan_runtime else []
+                issues = (
+                    plan_runtime.after_tool(tool_name, tc.get("args") or {}, result_text)
+                    if plan_runtime is not None and not is_worker_entry else []
+                )
                 if issues:
                     result_text += "\n【结果质量校验】" + "；".join(issues) + "。请勿生成确定性结论。"
-                outs.append(ToolMessage(content=result_text, tool_call_id=tc.get("id", ""), name=tc.get("name")))
+                outs.append(ToolMessage(content=result_text, tool_call_id=tc.get("id", ""), name=tool_name))
                 if entry is not None:
-                    trace.end(entry, result, status="ok")
+                    status = "timeout" if result_text.startswith((
+                        "[WORKER_TIMEOUT]", "[TOOL_TIMEOUT]"
+                    )) else "busy" if result_text.startswith("[WORKER_BUSY]") else "ok"
+                    trace.end(entry, result, status=status)
             except Exception as e:  # noqa: BLE001 —— 工具异常统一转 ToolMessage，交给 LLM 反思
                 outs.append(ToolMessage(
-                    content=f"工具执行异常：{e}", tool_call_id=tc.get("id", ""), name=tc.get("name")))
-                if plan_runtime is not None:
-                    plan_runtime.after_tool(tc.get("name") or "?", tc.get("args") or {}, f"工具执行异常：{e}")
+                    content=f"工具执行异常：{e}", tool_call_id=tc.get("id", ""), name=tool_name))
+                if plan_runtime is not None and is_worker_entry:
+                    plan_runtime.record_worker_failure(tool_name, "error", str(e))
+                elif plan_runtime is not None:
+                    plan_runtime.after_tool(tool_name, tc.get("args") or {}, f"工具执行异常：{e}")
                 if entry is not None:
                     trace.end(entry, f"工具执行异常：{e}", status="error")
 

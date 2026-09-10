@@ -5,7 +5,15 @@ from langchain_anthropic import ChatAnthropic
 
 from app.core.factories import (
     build_llm_from, build_llm, build_engine, invalidate,
-    PROVIDER_DEFAULT_BASE_URL, _resolve_secret,
+    PROVIDER_DEFAULT_BASE_URL, _resolve_secret, mysql_engine_options,
+)
+from app.core.timeouts import (
+    DB_CONNECT_TIMEOUT_SECONDS,
+    DB_POOL_TIMEOUT_SECONDS,
+    DB_READ_TIMEOUT_SECONDS,
+    DB_WRITE_TIMEOUT_SECONDS,
+    LLM_MAX_RETRIES,
+    LLM_REQUEST_TIMEOUT_SECONDS,
 )
 from app.meta import crypto
 
@@ -15,6 +23,8 @@ def test_openai_provider_returns_chat_openai():
     llm = build_llm_from("openai", "gpt-4o", "sk-1", "https://api.openai.com/v1", temperature=0.5)
     assert isinstance(llm, ChatOpenAI)
     assert llm.temperature == 0.5
+    assert llm.request_timeout == LLM_REQUEST_TIMEOUT_SECONDS
+    assert llm.max_retries == LLM_MAX_RETRIES
 
 
 def test_qwen_uses_openai_compatible():
@@ -27,6 +37,8 @@ def test_anthropic_provider():
     llm = build_llm_from("anthropic", "claude-3-5-sonnet", "sk-3", None)
     assert isinstance(llm, ChatAnthropic)
     assert llm.model == "claude-3-5-sonnet"
+    assert llm.default_request_timeout == LLM_REQUEST_TIMEOUT_SECONDS
+    assert llm.max_retries == LLM_MAX_RETRIES
 
 
 def test_default_provider_is_openai():
@@ -71,3 +83,14 @@ def test_build_engine_uri_construction(isolated_storage):
     assert e1 is e2
     invalidate(db_cfg=cfg)
     assert build_engine(cfg) is not e1
+
+
+def test_mysql_engine_options_bound_connection_and_pool_waits():
+    options = mysql_engine_options()
+    assert options["pool_timeout"] == DB_POOL_TIMEOUT_SECONDS
+    assert options["max_overflow"] == 0
+    assert options["connect_args"] == {
+        "connect_timeout": DB_CONNECT_TIMEOUT_SECONDS,
+        "read_timeout": DB_READ_TIMEOUT_SECONDS,
+        "write_timeout": DB_WRITE_TIMEOUT_SECONDS,
+    }

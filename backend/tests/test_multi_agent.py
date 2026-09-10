@@ -1,12 +1,23 @@
 """P1 分析角色：角色注册 / 验证门禁 / 子图执行 / 主管路由。"""
+import time
+import threading
+
+import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 
 from app.agent.multi_agent import (
-    make_agent, SQL_TOOL_NAMES, VIZ_TOOL_NAMES, FILE_TOOL_NAMES, STAT_TOOL_NAMES,
+    _invoke_with_timeout,
+    make_agent,
+    SQL_TOOL_NAMES,
+    VIZ_TOOL_NAMES,
+    FILE_TOOL_NAMES,
+    STAT_TOOL_NAMES,
+    WorkerTimeoutError,
 )
+from app.agent.analysis_plan import AnalysisPlan, PlanRuntime
 from app.agent.prompts import SUPERVISOR_PROMPT
 from app.tools.agent_tools import make_tools
 
@@ -120,6 +131,69 @@ def test_fallback_when_no_tools():
     assert prompt == SUPERVISOR_PROMPT  # prompt 仍返回（调用方统一使用）
     result = graph.invoke({"messages": [HumanMessage(content="hi")]})
     assert result["messages"][-1].content == "hi"
+
+
+def test_worker_timeout_is_bounded():
+    started = time.monotonic()
+
+    with pytest.raises(WorkerTimeoutError):
+        _invoke_with_timeout(lambda: time.sleep(0.2), 0.01)
+
+    assert time.monotonic() - started < 0.15
+
+
+def test_timed_out_worker_keeps_slot_until_background_thread_finishes():
+    semaphore = threading.BoundedSemaphore(1)
+    assert semaphore.acquire(blocking=False)
+
+    with pytest.raises(WorkerTimeoutError):
+        _invoke_with_timeout(
+            lambda: time.sleep(0.1),
+            0.01,
+            on_complete=semaphore.release,
+        )
+
+    assert not semaphore.acquire(blocking=False)
+    time.sleep(0.15)
+    assert semaphore.acquire(blocking=False)
+    semaphore.release()
+
+
+def test_worker_timeout_marks_analysis_unusable():
+    runtime = PlanRuntime(
+        AnalysisPlan(goal="统计订单", metrics=["订单数"]),
+        "统计订单",
+    )
+    runtime.record_worker_failure("data_executor", "timeout", "超过 1 秒")
+    report = runtime.validate_evidence()
+
+    assert runtime.validation_status == "rejected"
+    assert report["status"] == "rejected"
+    assert any("data_executor执行超时" in issue for issue in report["issues"])
+
+
+def test_busy_worker_is_not_queued_and_marks_plan_unusable():
+    runtime = PlanRuntime(AnalysisPlan(goal="统计订单", metrics=["订单数"]), "统计订单")
+    semaphore = threading.BoundedSemaphore(1)
+    assert semaphore.acquire(blocking=False)
+    llm = FakeLLM(responses=[
+        _tool_call("data_executor", {"request": "查询订单"}, "c1"),
+        AIMessage(content="当前资源繁忙，请稍后重试。"),
+    ])
+    graph, _ = make_agent(
+        llm,
+        _all_tools(),
+        plan_runtime=runtime,
+        worker_semaphore=semaphore,
+    )
+
+    result = graph.invoke({"messages": [HumanMessage(content="订单数？")]})
+    semaphore.release()
+
+    worker_message = next(message.content for message in result["messages"]
+                          if message.type == "tool" and message.name == "data_executor")
+    assert worker_message.startswith("[WORKER_BUSY]")
+    assert any("data_executor资源繁忙" in issue for issue in runtime.plan.quality_issues)
 
 
 # ── 图表标记回传（前端渲染的关键）────────────────────────────────────────────

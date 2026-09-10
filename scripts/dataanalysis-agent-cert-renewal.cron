@@ -1,0 +1,5 @@
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Let’s Encrypt 的 IP 证书有效期为 6 天；每日检查并在更新后重载 Caddy。
+27 3 * * * /opt/dataanalysis-agent-20260910/scripts/renew-ip-certificate.sh >> /var/log/dataanalysis-agent-cert-renewal.log 2>&1

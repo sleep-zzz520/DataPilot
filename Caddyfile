@@ -1,0 +1,23 @@
+{
+    # 数字 IP 的常规浏览器访问通常不带 SNI；默认选用该 IP 的受信任证书。
+    default_sni 121.43.124.98
+}
+
+# HTTP 保留给证书续期验证，其余请求永久跳转到受信任的 IP HTTPS 地址。
+http://121.43.124.98 {
+    @acme path /.well-known/acme-challenge/*
+    handle @acme {
+        root * /var/www/certbot
+        file_server
+    }
+
+    handle {
+        redir https://121.43.124.98{uri} permanent
+    }
+}
+
+# Let’s Encrypt 为公网 IP 签发的短期证书由 Certbot 自动续期。
+https://121.43.124.98 {
+    tls /etc/letsencrypt/live/121.43.124.98/fullchain.pem /etc/letsencrypt/live/121.43.124.98/privkey.pem
+    reverse_proxy frontend:80
+}

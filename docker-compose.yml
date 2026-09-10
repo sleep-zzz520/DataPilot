@@ -4,8 +4,6 @@ services:
   backend:
     build: ./backend
     container_name: da-backend
-    ports:
-      - "8000:8000"
     volumes:
       # 运行时数据（配置加密 JSON、SQLite、上传文件）持久化在宿主机
       - ./backend/data:/app/data
@@ -14,9 +12,38 @@ services:
   frontend:
     build: ./frontend
     container_name: da-frontend
-    ports:
-      - "8080:80"
     depends_on:
       backend:
         condition: service_healthy
     restart: unless-stopped
+
+  # 公网入口：当前先保持 HTTP，以便 Let’s Encrypt 通过 HTTP-01 验证
+  # 对外 HTTPS 切换后由 Caddy 统一重定向 HTTP 并代理到 frontend。
+  caddy:
+    image: caddy:2.10-alpine
+    container_name: da-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certbot/www:/var/www/certbot:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+    restart: unless-stopped
+
+  # 通过公网 IP 申请 Let’s Encrypt 短期证书；证书文件持久化在宿主机。
+  certbot:
+    image: certbot/certbot:v5.4.0
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    profiles:
+      - certificate
+
+volumes:
+  caddy_data:
+  caddy_config:

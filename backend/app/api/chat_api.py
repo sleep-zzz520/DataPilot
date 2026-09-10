@@ -87,6 +87,16 @@ def _load_uploaded_dfs(file_ids: List, user_id: int) -> dict:
         dfs[meta["name"]] = df
     return dfs
 
+
+def _uploaded_file_paths(file_ids: List, user_id: int) -> dict:
+    """返回当前用户上传文件的受控落盘路径，供本地工具子进程重读。"""
+    paths: dict = {}
+    for fid in file_ids:
+        meta = get_upload(str(fid), user_id)
+        if meta and meta.get("name") and meta.get("path"):
+            paths[meta["name"]] = meta["path"]
+    return paths
+
 # 每个 session 一个 asyncio 锁：串行化同一会话的对话处理，
 # 避免并发请求交错读写内存/SQLite 导致消息错乱（串话、重复）。
 _chat_locks: dict = {}
@@ -325,8 +335,10 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
 
             # 上传文件 → DataFrame 字典（供 file_tool 真实查询，磁盘+LRU）
             uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
+            uploaded_file_paths = _uploaded_file_paths(req.file_ids, user["uid"])
             tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
-                               audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid})
+                               audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid},
+                               file_paths=uploaded_file_paths)
             ctx = ""
             for fid in req.file_ids:
                 meta = get_upload(str(fid), user["uid"])
@@ -470,8 +482,10 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
 
                 # 上传文件 → DataFrame 字典（供 file_tool 真实查询）
                 uploaded_files = _load_uploaded_dfs(req.file_ids, user["uid"])
+                uploaded_file_paths = _uploaded_file_paths(req.file_ids, user["uid"])
                 tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
-                                   audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid})
+                                   audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid},
+                                   file_paths=uploaded_file_paths)
                 ctx = ""
                 for fid in req.file_ids:
                     meta = get_upload(str(fid), user["uid"])

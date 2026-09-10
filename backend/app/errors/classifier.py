@@ -29,7 +29,11 @@ def classify_llm_error(e: Exception) -> dict:
                   "减少一次性查询的数据量，或新开一轮对话。", "warn")
 
     # —— 网络 / 地址不通 ——
-    if _is_conn_error(e) or _has(body, "Connection", "timeout", "Name or service not known"):
+    if _is_timeout(e):
+        return _r("LLM_TIMEOUT", "模型响应超时。",
+                  "请缩小问题范围后重试；若持续发生，请检查模型服务延迟。", "warn")
+
+    if _is_conn_error(e) or _has(body, "Connection", "Name or service not known"):
         return _r("LLM_NETWORK", "无法连接到模型服务地址。",
                   "请检查 Base URL 是否正确、服务器能否访问外网/该地址。", "block")
 
@@ -39,6 +43,10 @@ def classify_llm_error(e: Exception) -> dict:
 def classify_db_error(e: Exception) -> dict:
     errno = _extract_mysql_errno(e)               # PyMySQL 的 errno，如 1045/2003
     msg = str(e)
+
+    if errno == 3024 or _is_timeout(e):
+        return _r("DB_TIMEOUT", "数据库查询超时。",
+                  "请缩小查询范围、增加过滤条件或优化 SQL 后重试。", "warn")
 
     if errno == 2003 or _is_conn_error(e):
         return _r("DB_CONNECT", "连不上数据库服务器。",
@@ -68,6 +76,11 @@ def _safe(body):        return (body or "")[:60]
 def _is_conn_error(e):
     return type(e).__name__ in ("ConnectionError","ConnectTimeout","ConnectionRefusedError",
                                 "OperationalError") and any(k in str(e) for k in ("Can't connect","refused","timed out","getaddrinfo"))
+def _is_timeout(e):
+    s = (type(e).__name__ + " " + str(e)).lower()
+    return any(k in s for k in ("timeout", "timed out", "read timed out",
+                                "max_execution_time", "maximum statement execution time",
+                                "query execution was interrupted"))
 def _extract_http(e):
     status = getattr(getattr(e, "response", None), "status_code", None) or getattr(e, "status_code", None)
     body = getattr(getattr(e, "response", None), "text", None) or getattr(e, "body", None) or str(e)

@@ -1,6 +1,7 @@
 import json, re
 import pandas as pd
 from langchain_core.tools import tool
+from app.core.timeouts import MYSQL_MAX_EXECUTION_TIME_MS
 from app.db.schema import list_business_schemas, get_schema_text, get_table_schema_text
 from app.tools.chart_tool import get_chart_tools
 from app.tools.file_tool import make_file_tools
@@ -11,6 +12,32 @@ _BARE_DASH = re.compile(r"(?<!`)(share-[A-Za-z0-9_]+)(?!`)")
 
 # 长工具输出压缩：查询结果 markdown 最多展示的行数（省 token，前端表格仍取 machine rows）
 _TOOL_MAX_ROWS = 50
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in (
+        "timeout", "timed out", "max_execution_time",
+        "maximum statement execution time", "query execution was interrupted",
+    ))
+
+
+def _read_mysql_with_timeout(sql: str, engine):
+    """在同一连接上设置 MySQL 的 SELECT 时限后再读取数据。"""
+    # engine=None 是安全校验/单测路径；生产请求一定提供 SQLAlchemy Engine。
+    if engine is None:
+        return pd.read_sql(sql, engine)
+    with engine.connect() as conn:
+        try:
+            conn.exec_driver_sql(
+                f"SET SESSION max_execution_time = {MYSQL_MAX_EXECUTION_TIME_MS}"
+            )
+            return pd.read_sql(sql, conn)
+        except Exception as exc:
+            # read_timeout 可能留下半断开的 socket，不能把它归还给连接池复用。
+            if _is_timeout_error(exc):
+                conn.invalidate(exc)
+            raise
 
 def _to_md(df, max_rows: int = None):
     """DataFrame → Markdown 表格。max_rows 限制正文行数，超出省略并提示（压缩长输出）。"""
@@ -29,7 +56,7 @@ def _to_md(df, max_rows: int = None):
         body += f"\n| …（共 {len(df)} 行，已省略 {omitted} 行，仅展示前 {max_rows} 行） |"
     return "\n".join([head, sep, body])
 
-def make_tools(engine, default_schema=None, files=None, audit_ctx=None):
+def make_tools(engine, default_schema=None, files=None, audit_ctx=None, file_paths=None):
     """构造工具集。files: {文件名: DataFrame}，有上传文件时注册文件分析工具。
 
     audit_ctx: 可选 {"user_id","username","session_id"}，传入后 SQL 执行会写审计日志。
@@ -75,7 +102,7 @@ def make_tools(engine, default_schema=None, files=None, audit_ctx=None):
         if "limit" not in sql.lower():
             sql = sql.rstrip(";") + " LIMIT 500"
         try:
-            df = pd.read_sql(sql, engine)
+            df = _read_mysql_with_timeout(sql, engine)
             if ctx:
                 _audit_sql(sql, len(df), "mysql")
             d2 = df.head(200)
@@ -83,6 +110,11 @@ def make_tools(engine, default_schema=None, files=None, audit_ctx=None):
                        "rows": d2.where(d2.notna(), None).values.tolist()}
             return _to_md(df, max_rows=_TOOL_MAX_ROWS) + f"\n<!--TABLE:{json.dumps(machine, ensure_ascii=False, default=str)}-->"
         except Exception as e:
+            if _is_timeout_error(e):
+                return (
+                    "[TOOL_TIMEOUT] query_mysql 查询超时：数据库未在规定时间内返回。"
+                    "请缩小时间范围、增加过滤条件或优化 SQL 后重试。"
+                )
             return f"SQL 执行错误：{e}  请根据此错误修正 SQL 后重试（最多 3 次）。"
 
     # 基础图表工具（保留兼容性）
@@ -103,7 +135,7 @@ def make_tools(engine, default_schema=None, files=None, audit_ctx=None):
     chart_tools = get_chart_tools()
 
     # 上传文件分析工具（有文件时才注册）
-    file_tools = make_file_tools(files or {}, audit_ctx=ctx)
+    file_tools = make_file_tools(files or {}, audit_ctx=ctx, file_paths=file_paths)
     # 统计工具只由 statistical_validator 子图使用；LLM 选择方法，Python/numpy 计算数值。
     statistical_tools = make_statistical_tools()
 

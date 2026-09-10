@@ -189,7 +189,11 @@ class PlanRuntime:
 
     def after_tool(self, tool: str, args: dict, result: str) -> list[str]:
         issues: List[str] = []
-        failed = "错误" in (result or "") or "异常" in (result or "")
+        failed = (
+            "错误" in (result or "")
+            or "异常" in (result or "")
+            or (result or "").startswith("[TOOL_TIMEOUT]")
+        )
         payload = self._table_payload(result)
         if tool in ("query_mysql", "query_file"):
             self._query_seen = True
@@ -274,6 +278,26 @@ class PlanRuntime:
                 step.error = "；".join(reasons) if reasons else None
         self._emit()
         return dict(self.validation_report)
+
+    def record_worker_failure(self, worker: str, status: str, detail: str = "") -> None:
+        """记录 Worker 级失败；超时/异常不能被当成没有问题的空结果。"""
+        labels = {
+            "timeout": "执行超时",
+            "error": "执行异常",
+            "busy": "资源繁忙",
+        }
+        label = labels.get(status, status)
+        issue = f"{worker}{label}"
+        if detail:
+            issue += f"：{detail}"
+        if issue not in self.plan.quality_issues:
+            self.plan.quality_issues.append(issue)
+        if worker in ("statistical_validator", "insight_writer"):
+            self.validation_status = "rejected"
+        elif worker == "data_executor":
+            # 数据执行失败时保持 pending，后续 validate_evidence 会因无证据拒绝。
+            self.validation_status = "pending"
+        self._emit()
 
     def finalize(self):
         for step in self.plan.steps:

@@ -19,7 +19,7 @@
     depth        调用层级（0 = 主管直接调用；专家内部工具 = 1）
     input        入参摘要（截断为单行）
     output       结果摘要（截断为单行）
-    status       running / ok / error
+    status       running / ok / error / timeout / busy
     duration_ms  工具执行耗时
 """
 from __future__ import annotations

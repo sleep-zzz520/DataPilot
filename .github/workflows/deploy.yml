@@ -1,0 +1,89 @@
+name: Deploy to Aliyun
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: dataanalysis-agent-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_HOST: 121.43.124.98
+  DEPLOY_USER: github-deploy
+  DEPLOY_PATH: /opt/dataanalysis-agent-20260910
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the tested revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      - name: Configure the deployment connection
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Synchronize application source
+        run: |
+          set -euo pipefail
+          rsync -az --delete --no-owner --no-group --itemize-changes \
+            -e "ssh -i $HOME/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=yes" \
+            --exclude='/.git/' \
+            --exclude='/.github/' \
+            --exclude='/.idea/' \
+            --exclude='/.venv/' \
+            --exclude='/venv/' \
+            --exclude='/AGENTS.md' \
+            --exclude='/backend/.env' \
+            --exclude='/backend/data/' \
+            --exclude='/certbot/' \
+            --exclude='/frontend/node_modules/' \
+            --exclude='/frontend/dist/' \
+            --exclude='/.pytest_cache/' \
+            --exclude='/**/__pycache__/' \
+            --exclude='/tmp/' \
+            --exclude='/scripts/renew-ip-certificate.sh' \
+            --exclude='/scripts/dataanalysis-agent-cert-renewal.cron' \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
+
+      - name: Rebuild services on the server
+        run: |
+          set -euo pipefail
+          ssh -i "$HOME/.ssh/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" "cd '$DEPLOY_PATH' && docker compose config --quiet && docker compose up -d --build --force-recreate backend frontend caddy && docker compose ps"
+
+      - name: Check the public service
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+              "https://$DEPLOY_HOST/api/health/ready"; then
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "The public readiness endpoint did not become healthy in time." >&2
+          exit 1
