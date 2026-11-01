@@ -1,0 +1,11 @@
+{
+  "enabled_contract_ids": ["demo.net_sales", "demo.net_profit"],
+  "contracts": [
+    {"id": "demo.net_sales", "version": "1", "name": "净销售额", "formula": "SUM(sales_amount) - SUM(refund_amount)", "required_columns": ["sales_amount", "refund_amount"], "required_filters": ["status = 'paid'"], "unit": "CNY", "source": "df", "scope": "示例：含税销售额减退款；仅已支付订单，无币种换算", "metric_names": ["净销售额"]},
+    {"id": "demo.net_profit", "version": "1", "name": "净利润", "formula": "SUM(sales_amount) - SUM(refund_amount) - SUM(cost_amount)", "required_columns": ["sales_amount", "refund_amount", "cost_amount"], "required_filters": ["status = 'paid'"], "unit": "CNY", "source": "df", "scope": "示例：cost_amount已包含全部成本费用和税款；需业务方确认后启用", "metric_names": ["净利润"]}
+  ],
+  "source_bindings": {
+    "demo.net_sales": {"file_names": ["sales.csv"]},
+    "demo.net_profit": {"file_names": ["sales.csv"]}
+  }
+}

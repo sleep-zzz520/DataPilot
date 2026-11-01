@@ -18,12 +18,16 @@ from app.agent.multi_agent import make_agent
 from app.errors.classifier import classify_any
 from app.audit import record, A_FILE_UPLOAD, A_SESSION_ACTION, A_HITL_CONFIRMATION
 from app.usage import check_budget, record_usage, extract_usage
+from app.usage.callback import RequestUsage, with_request_usage
+from app.memory.context import assemble_context
 from app.memory.agent_memory import (
     build_memory_context, extract_and_store_memories, summary_due, generate_summary,
     save_analysis_record, delete_analysis_records,
 )
 from app.db.schema import list_tables
 from app.agent.analysis_plan import AnalysisPlan, make_analysis_plan_graph, PlanRuntime, plan_context
+from app.agent.contracts import MetricContractRegistry, ContractBinding, ValidationIssue, bind_metric_contracts
+from app.agent.contract_catalog import load_contract_catalog
 from app.agent.hitl import assess_confirmation
 from app.memory import get_history, save_messages, clear_session
 from app.memory.store import budget_history, estimate_tokens, MAX_TOKENS
@@ -33,6 +37,7 @@ from app.agent.prompts import SUPERVISOR_PROMPT, CONVERSATION_HINT
 # ── 对话记录持久化（SQLite 镜像，不影响现有记忆系统）─────────────────────────
 from app.persistence import (
     persist_messages,
+    persist_guarded_response,
     load_session as db_load_session,
     list_sessions as db_list_sessions,
     delete_session as db_delete_session,
@@ -53,6 +58,7 @@ router = APIRouter()
 # 上传文件落盘目录 + DataFrame 懒加载缓存（避免每次请求重复解析）
 _BACKEND_DIR = Path(__file__).resolve().parents[2]  # backend/
 _UPLOAD_DIR = _BACKEND_DIR / "data" / "uploads"
+_CONTRACT_CONFIG = _BACKEND_DIR / "config" / "metric_contracts.json"
 _file_df_cache: "OrderedDict[str, pd.DataFrame]" = OrderedDict()
 _file_df_cache_lock = threading.Lock()
 _FILE_DF_CACHE_MAX = 12
@@ -152,12 +158,15 @@ class ChatRequest(BaseModel):
     file_ids: List = []
     approval_id: Optional[str] = None
     approval_decision: Optional[Literal["approve", "reject"]] = None
+    agent_mode: Literal["auto", "single", "multi"] = "auto"
+    metric_contract_ids: List[str] = []
 
 _CHART_RE = re.compile(r"<!--CHART:(.*?)-->", re.S)
 _TABLE_RE = re.compile(r"<!--TABLE:(.*?)-->", re.S)
 _IMAGE_RE = re.compile(r"<!--IMAGE_BASE64:(.*?)-->", re.S)
 
-def _build_plan(llm, engine, question: str, schema: Optional[str], file_ids: list, user_id: int):
+def _build_plan(llm, engine, question: str, schema: Optional[str], file_ids: list, user_id: int,
+                memory_context: str = ""):
     """规划失败只降级，不阻断原有 Agent；返回计划和 SSE 事件。"""
     try:
         catalog = list_tables(engine, schema)
@@ -169,6 +178,7 @@ def _build_plan(llm, engine, question: str, schema: Optional[str], file_ids: lis
         catalog = []
     result = make_analysis_plan_graph(llm).invoke({
         "question": question, "catalog": catalog, "plan": None, "error": None,
+        "memory_context": memory_context,
     })
     plan = result["plan"]
     return plan, {"type": "plan", "event": "plan_created", "plan": plan.model_dump(exclude_none=True)}
@@ -182,8 +192,53 @@ def _request_hash(req: ChatRequest, sid: str) -> str:
         "file_ids": sorted(str(fid) for fid in (req.file_ids or [])),
         "llm_config_id": req.llm_config_id,
         "db_config_id": req.db_config_id,
+        "agent_mode": req.agent_mode,
+        "metric_contract_ids": sorted(req.metric_contract_ids),
+        "contract_registry_sha256": sha256(_CONTRACT_CONFIG.read_bytes()).hexdigest() if _CONTRACT_CONFIG.exists() else None,
     }, ensure_ascii=False, sort_keys=True)
     return sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _memory_scope(req: ChatRequest) -> str:
+    """Preferences and reusable analyses must not bleed across data configurations."""
+    return "db:{}:files:{}".format(req.db_config_id, ",".join(sorted(str(f) for f in req.file_ids)))
+
+
+def _load_contract_registry():
+    config = json.loads(_CONTRACT_CONFIG.read_text()) if _CONTRACT_CONFIG.exists() else {}
+    return MetricContractRegistry.from_config(config), config.get("source_bindings", {})
+
+
+def _bind_request_contracts(req, plan, engine, user):
+    registry, policies = _load_contract_registry()
+    if not req.metric_contract_ids and not registry.enabled():
+        return None, []  # Legacy requests remain usable until owner configures definitions.
+    selected = [registry.get(key) for key in req.metric_contract_ids]
+    selected = [item for item in selected if item is not None] or list(registry.enabled())
+    catalog, issues = [], []
+    uploads = [get_upload(str(fid), user["uid"]) for fid in req.file_ids]
+    uploads = [item for item in uploads if item]
+    if len(uploads) == 1:
+        catalog.append({"name": "df", "columns": uploads[0].get("columns", []), "file_name": uploads[0]["name"]})
+    sources = {c.source for c in selected if c.source != "df"}
+    sources.update(join.source for c in selected for join in c.join_constraints)
+    if sources:
+        catalog.extend(load_contract_catalog(engine, sources))
+    binding = bind_metric_contracts(req.message, plan, catalog, registry,
+                                    contract_ids=req.metric_contract_ids or None)
+    for contract in binding.contracts:
+        policy = policies.get(contract.id, {})
+        valid = (len(uploads) == 1 and uploads[0]["name"] in policy.get("file_names", [])) if contract.source == "df" else req.db_config_id in policy.get("db_config_ids", [])
+        if not valid:
+            issues.append(ValidationIssue(code="CONTRACT_SOURCE_BINDING_REQUIRED", expected=contract.id,
+                                          actual="current source is not configured", action="clarify"))
+    if issues:
+        binding = binding.model_copy(update={"issues": binding.issues + tuple(issues)})
+    plan.bound_contracts = [contract.model_dump(mode="json") for contract in binding.contracts]
+    if binding.issues:
+        plan.clarification_needed = True
+        plan.clarification_question = "指标契约尚不能满足：请确认已启用的指标定义、必要字段及授权数据源。"
+    return binding, catalog
 
 
 def _audit_hitl(user: dict, sid: str, status: str, confirmation: dict,
@@ -214,17 +269,36 @@ def _resolve_plan(req: ChatRequest, sid: str, llm, engine, schema: Optional[str]
         if result["status"] == "rejected":
             return {"kind": "rejected", "confirmation": confirmation}
         plan_data = result["payload"]["plan"]
+        resumed = AnalysisPlan.model_validate(plan_data)
+        binding, catalog = _bind_request_contracts(req, resumed, engine, user)
+        if binding is not None and binding.issues:
+            return {"kind": "confirmation", "plan": resumed, "confirmation": assess_confirmation(req.message, resumed),
+                    "plan_event": {"type": "plan", "plan": resumed.model_dump()}, "binding": binding, "catalog": catalog}
         return {
             "kind": "ready",
-            "plan": AnalysisPlan.model_validate(plan_data),
+            "plan": resumed,
+            "binding": binding, "catalog": catalog,
             "plan_event": {"type": "plan", "event": "plan_resumed", "plan": plan_data},
         }
 
-    plan, plan_event = _build_plan(llm, engine, req.message, schema, req.file_ids, user["uid"])
+    memory_context = build_memory_context(user["uid"], sid, req.message, scope=_memory_scope(req)) or ""
+    registry, _ = _load_contract_registry()
+    if registry.enabled():
+        memory_context += "\n【服务端已启用指标定义；禁止自行修改，仅选择与问题相符的指标】\n" + json.dumps(
+            [c.model_dump(mode="json") for c in registry.enabled()], ensure_ascii=False)
+    _ensure_loaded(sid, user["uid"])
+    recent = budget_history([m for m in get_history(sid) if isinstance(m, (HumanMessage, AIMessage))
+                             and not getattr(m, "tool_calls", None)], 1000)
+    if recent:
+        memory_context += "\n【近期对话参考；当前用户要求优先】\n" + "\n".join(
+            f"[{m.type}] {m.content}" for m in recent)
+    plan, plan_event = _build_plan(llm, engine, req.message, schema, req.file_ids, user["uid"], memory_context)
+    binding, catalog = _bind_request_contracts(req, plan, engine, user)
+    plan_event["plan"] = plan.model_dump(exclude_none=True)
     file_metadata = [get_upload(str(fid), user["uid"]) or {} for fid in req.file_ids]
     confirmation = assess_confirmation(req.message, plan, file_metadata)
     if not confirmation.get("required"):
-        return {"kind": "ready", "plan": plan, "plan_event": plan_event}
+        return {"kind": "ready", "plan": plan, "plan_event": plan_event, "binding": binding, "catalog": catalog}
     if confirmation.get("mode") == "clarification":
         _audit_hitl(user, sid, "clarification_required", confirmation)
         return {"kind": "confirmation", "plan": plan, "confirmation": confirmation,
@@ -241,10 +315,22 @@ def _resolve_plan(req: ChatRequest, sid: str, llm, engine, schema: Optional[str]
             "plan_event": plan_event}
 
 
+# 超时类质量问题：用户侧应看到"请重试"，而不是"数据质量不通过"。
+_TIMEOUT_MARKERS = ("超时", "timeout")
+
+
 def _guard_reply(reply: str, plan, validation_status: Optional[str] = None) -> str:
     """质量校验未通过时，把限制明确呈现给用户，避免模型只给确定性结论。"""
     warnings = list(dict.fromkeys(plan.quality_issues))
     if plan.metrics and validation_status and validation_status != "approved":
+        # 区分"超时"与"数据质量问题"：前者用户能自救（重试 / 缩小范围），
+        # 后者需要用户调整口径。混在一起会让用户误以为数据本身有问题。
+        timeouts = [item for item in warnings if any(mark in item for mark in _TIMEOUT_MARKERS)]
+        if timeouts:
+            return (
+                "本轮分析在等待查询或验证时超时，未能完成校验，因此暂不给出确定性结论。"
+                "建议缩小查询范围（例如限定时间区间或减少分组）后重试。"
+            )
         detail = "；".join(warnings) if warnings else "尚未完成真实证据的统计验证"
         return "本轮统计验证未通过，暂不生成确定性结论。原因：" + detail + "。"
     if warnings:
@@ -297,12 +383,22 @@ def _ensure_session_access(sid: Optional[str], uid: int) -> None:
         raise HTTPException(403, "无权访问该会话")
 
 
+def _record_request_usage(usage, req, sid, user):
+    if usage is None:
+        return
+    cfg = get_llm_secret(req.llm_config_id) or {}
+    usage.finalize(lambda input_tokens, output_tokens: record_usage(
+        user["uid"], user.get("username"), sid, req.llm_config_id,
+        cfg.get("provider"), cfg.get("model_name"), input_tokens, output_tokens))
+
+
 @router.post("/api/chat")
 async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
     sid = req.session_id or str(uuid.uuid4())
     _ensure_session_access(req.session_id, user["uid"])
     lock = await _session_lock(sid)
     async with lock:  # 同一会话串行处理，避免并发交错
+        usage = None
         try:
             # ── 同请求防重：30s 内相同请求拒绝，不调 LLM ──────────────────
             dup = _check_duplicate(sid, req.message, req.file_ids, req.approval_id, req.approval_decision)
@@ -316,7 +412,8 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
                 return {"reply": None, "chart": None, "table": None, "sql": None, "session_id": sid,
                         "error": {"code": "BUDGET_LIMIT", "message": "模型调用预算已用完",
                                   "suggestion": reason, "severity": "block"}}
-            llm = build_llm(get_llm_secret(req.llm_config_id))
+            usage = RequestUsage()
+            llm = with_request_usage(build_llm(get_llm_secret(req.llm_config_id)), usage)
             db_cfg = get_db_secret(req.db_config_id)
             engine = build_engine(db_cfg)
             resolution = _resolve_plan(req, sid, llm, engine, db_cfg.get("default_schema"), user)
@@ -345,9 +442,15 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
                 if meta:
                     ctx += f"\n[用户上传文件 {meta['name']}] 列：{meta['columns']} 预览行：{meta['preview_rows']}\n"
             user_text = (ctx + "\n" + req.message) if ctx else req.message
-            runtime = PlanRuntime(plan, req.message)
+            # P0：把上传文件的真实列名交给 PlanRuntime，用于拦截"编造数据源不存在的维度"
+            data_columns: List[str] = []
+            for _df in uploaded_files.values():
+                data_columns.extend([str(col) for col in _df.columns])
+            runtime = PlanRuntime(plan, req.message, columns=data_columns,
+                                  binding=resolution.get("binding"), catalog=resolution.get("catalog"))
             trace = TraceCollector()
-            graph, supervisor_prompt = make_agent(llm, tools, trace=trace, plan_runtime=runtime)
+            graph, supervisor_prompt = make_agent(llm, tools, trace=trace, plan_runtime=runtime,
+                                                   mode=req.agent_mode, question=req.message)
 
             # ── 多轮对话：先从 SQLite 懒加载（服务重启后自动恢复）───────────────
             _ensure_loaded(sid, user["uid"])
@@ -356,13 +459,11 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             # 历史 + 当前消息总估算 token 不超过预算，防止上下文无限膨胀 ──
             system_prompt = supervisor_prompt + "\n\n" + CONVERSATION_HINT + "\n\n" + plan_context(plan)
             # ── 记忆注入：长期记忆（跨会话）+ 会话摘要 + 相关历史检索 ──────
-            memory_ctx = build_memory_context(user["uid"], sid, req.message)
-            if memory_ctx:
-                system_prompt += "\n\n" + memory_ctx
-            history = budget_history(history, MAX_TOKENS - estimate_tokens(system_prompt))
-            input_messages = [
-                SystemMessage(content=system_prompt)
-            ] + history + [HumanMessage(content=user_text)]
+            memory_ctx = build_memory_context(user["uid"], sid, req.message, scope=_memory_scope(req))
+            input_messages = assemble_context(system_prompt, history, user_text, tools=tools,
+                                              memory_context=memory_ctx,
+                                              output_reserve=int(getattr(llm, "max_tokens", None) or 1024),
+                                              max_tokens=16000).messages
 
             result = await asyncio.to_thread(graph.invoke, {"messages": input_messages})
             result_messages = result["messages"]
@@ -379,28 +480,25 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             # ── 持久化：本轮完整消息写入 SQLite（幂等去重）。
             # 不用 get_history：内存 store 可能被 token 预算裁剪（大工具输出），
             # 裁剪只影响内存输入，持久化必须保留完整历史 ──
-            persist_messages(sid, [user_msg] + list(new_msgs), user["uid"])
+            persist_messages(sid, [user_msg] + list(new_msgs), user["uid"], pending_guard=True)
             # ── Agent 轨迹落库：重开会话可回看工具调用链 ────────────────
             save_trace(sid, trace.snapshot(), user["uid"])
 
             msgs = result_messages
-            visuals, tables, sql = _extract(msgs)
+            visuals, tables, sql = _extract(new_msgs)
+            if runtime.validation_status != "approved":
+                visuals, tables = [], []
             reply = msgs[-1].content if isinstance(msgs[-1], AIMessage) else ""
             reply = _guard_reply(reply, plan, runtime.validation_status)
-
-            # ── token 用量计量（成本估算 + 预算告警）──────────────────────
-            llm_cfg = get_llm_secret(req.llm_config_id)
-            in_t, out_t = extract_usage(result_messages)
-            if in_t or out_t:
-                record_usage(user["uid"], user.get("username"), sid, req.llm_config_id,
-                             llm_cfg.get("provider"), llm_cfg.get("model_name"), in_t, out_t)
+            persist_guarded_response(sid, user["uid"], user_msg.id, reply,
+                                     visuals=visuals, tables=tables, sql=sql)
 
             # ── 记忆沉淀：节流提取长期事实 + 节流更新会话摘要 ────────────
             extract_and_store_memories(llm, user["uid"], user.get("username"), sid,
-                                       req.message, reply)
+                                       req.message, reply, scope=_memory_scope(req))
             if summary_due(sid):
                 generate_summary(llm, sid, result_messages)
-            save_analysis_record(user["uid"], sid, req.message, plan, plan.evidence, reply)
+            save_analysis_record(user["uid"], sid, req.message, plan, plan.evidence, reply, scope=_memory_scope(req))
 
             # chart/table 字段保留兼容（取最后一个），前端主用 visuals/tables 数组
             return {
@@ -414,9 +512,12 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
                 "plan": plan.model_dump(exclude_none=True),
                 "evidence": plan.evidence,
                 "trace": trace.snapshot(),
+                "routing": getattr(graph, "route_decision", {}),
             }
         except Exception as e:
             return {"reply": None, "chart": None, "table": None, "sql": None, "session_id": sid, "error": classify_any(e)}
+        finally:
+            _record_request_usage(usage, req, sid, user)
 
 
 def _sse(obj: dict) -> str:
@@ -441,6 +542,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
 
     async def gen():
         async with lock:  # 同一会话串行处理，避免并发交错
+            usage = None
             try:
                 # ── 同请求防重：30s 内相同请求拒绝，不调 LLM ──────────────
                 dup = _check_duplicate(sid, req.message, req.file_ids, req.approval_id, req.approval_decision)
@@ -458,7 +560,8 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                                           "suggestion": reason, "severity": "block"},
                                 "session_id": sid})
                     return
-                llm = build_llm(get_llm_secret(req.llm_config_id))
+                usage = RequestUsage()
+                llm = with_request_usage(build_llm(get_llm_secret(req.llm_config_id)), usage)
                 db_cfg = get_db_secret(req.db_config_id)
                 engine = build_engine(db_cfg)
                 resolution = _resolve_plan(req, sid, llm, engine, db_cfg.get("default_schema"), user)
@@ -492,23 +595,28 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                     if meta:
                         ctx += f"\n[用户上传文件 {meta['name']}] 列：{meta['columns']} 预览行：{meta['preview_rows']}\n"
                 user_text = (ctx + "\n" + req.message) if ctx else req.message
+                # P0：把上传文件的真实列名交给 PlanRuntime，用于拦截"编造数据源不存在的维度"
+                data_columns: List[str] = []
+                for _df in uploaded_files.values():
+                    data_columns.extend([str(col) for col in _df.columns])
                 plan_updates = []
-                runtime = PlanRuntime(plan, req.message, on_update=lambda snapshot: plan_updates.append(snapshot))
+                runtime = PlanRuntime(plan, req.message, columns=data_columns,
+                                      binding=resolution.get("binding"), catalog=resolution.get("catalog"),
+                                      on_update=lambda snapshot: plan_updates.append(snapshot))
                 trace = TraceCollector()
-                graph, supervisor_prompt = make_agent(llm, tools, trace=trace, plan_runtime=runtime)
+                graph, supervisor_prompt = make_agent(llm, tools, trace=trace, plan_runtime=runtime,
+                                                       mode=req.agent_mode, question=req.message)
 
                 _ensure_loaded(sid, user["uid"])
                 history = get_history(sid)
                 # ── 上下文压缩：token 预算制截断（与同步接口一致）─────────
                 system_prompt = supervisor_prompt + "\n\n" + CONVERSATION_HINT + "\n\n" + plan_context(plan)
                 # ── 记忆注入：长期记忆 + 会话摘要 + 相关历史检索（与同步一致）─
-                memory_ctx = build_memory_context(user["uid"], sid, req.message)
-                if memory_ctx:
-                    system_prompt += "\n\n" + memory_ctx
-                history = budget_history(history, MAX_TOKENS - estimate_tokens(system_prompt))
-                input_messages = [
-                    SystemMessage(content=system_prompt)
-                ] + history + [HumanMessage(content=user_text)]
+                memory_ctx = build_memory_context(user["uid"], sid, req.message, scope=_memory_scope(req))
+                input_messages = assemble_context(system_prompt, history, user_text, tools=tools,
+                                                  memory_context=memory_ctx,
+                                                  output_reserve=int(getattr(llm, "max_tokens", None) or 1024),
+                                                  max_tokens=16000).messages
 
                 # 双流模式：
                 #  - "messages"：token 级文本 → 推送给前端（打字机效果）
@@ -522,8 +630,9 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 ):
                     if mode == "messages":
                         chunk, _meta = data
-                        if isinstance(chunk, AIMessageChunk) and chunk.content:
-                            yield _sse({"type": "delta", "text": chunk.content})
+                        # Text is emitted only after the final validation gate. Worker and
+                        # rejected candidate text must never reach the user as SSE deltas.
+                        pass
                     elif mode == "updates":
                         for _node, val in data.items():
                             msgs = val.get("messages") or []
@@ -547,21 +656,16 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 save_messages(sid, [user_msg] + list(all_new))
                 # ── 持久化：本轮完整消息写入 SQLite（幂等去重），
                 # 不依赖内存 store（可能被 token 预算裁剪）──
-                persist_messages(sid, [user_msg] + list(all_new), user["uid"])
+                persist_messages(sid, [user_msg] + list(all_new), user["uid"], pending_guard=True)
                 # ── Agent 轨迹落库：重开会话可回看工具调用链 ────────────
                 save_trace(sid, trace.snapshot(), user["uid"])
 
                 # ── 提取图表/SQL，发送最终结果 ────────────────────────────
                 result_messages = list(input_messages) + list(all_new)
                 runtime.finalize()
-                visuals, tables, sql = _extract(result_messages)
-
-                # ── token 用量计量（成本估算 + 预算告警）──────────────────
-                llm_cfg = get_llm_secret(req.llm_config_id)
-                in_t, out_t = extract_usage(result_messages)
-                if in_t or out_t:
-                    record_usage(user["uid"], user.get("username"), sid, req.llm_config_id,
-                                 llm_cfg.get("provider"), llm_cfg.get("model_name"), in_t, out_t)
+                visuals, tables, sql = _extract(all_new)
+                if runtime.validation_status != "approved":
+                    visuals, tables = [], []
 
                 reply = ""
                 for m in reversed(result_messages):
@@ -569,13 +673,17 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                         reply = m.content
                         break
                 reply = _guard_reply(reply, plan, runtime.validation_status)
+                persist_guarded_response(sid, user["uid"], user_msg.id, reply,
+                                         visuals=visuals, tables=tables, sql=sql)
+                if reply:
+                    yield _sse({"type": "delta", "text": reply})
 
                 # ── 记忆沉淀：节流提取长期事实 + 节流更新会话摘要 ──────────
                 extract_and_store_memories(llm, user["uid"], user.get("username"), sid,
-                                           req.message, reply)
+                                           req.message, reply, scope=_memory_scope(req))
                 if summary_due(sid):
                     generate_summary(llm, sid, result_messages)
-                save_analysis_record(user["uid"], sid, req.message, plan, plan.evidence, reply)
+                save_analysis_record(user["uid"], sid, req.message, plan, plan.evidence, reply, scope=_memory_scope(req))
 
                 yield _sse({
                     "type": "done",
@@ -589,9 +697,12 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                     "plan": plan.model_dump(exclude_none=True),
                     "evidence": plan.evidence,
                     "trace": trace.snapshot(),
+                    "routing": getattr(graph, "route_decision", {}),
                 })
             except Exception as e:
                 yield _sse({"type": "error", "error": classify_any(e), "session_id": sid})
+            finally:
+                _record_request_usage(usage, req, sid, user)
 
     return StreamingResponse(
         gen(),

@@ -216,3 +216,61 @@ def test_astream_tool_flow():
     asyncio.run(run())
     assert done.get("tools") == ["ToolMessage"]  # 工具节点产出 ToolMessage
     assert done.get("agent")  # agent 节点有多轮输出
+
+
+def test_query_budget_is_hard_even_when_model_ignores_stop():
+    calls = []
+
+    @tool
+    def query_mysql(sql: str) -> str:
+        """Record actual SQL calls."""
+        calls.append(sql)
+        return "SQL 执行错误：测试失败"
+
+    llm = FakeLLM(responses=[
+        _tool_call("query_mysql", {"sql": f"SELECT {i}"}, f"q{i}")
+        for i in range(10)
+    ])
+    graph = make_graph(llm, [query_mysql], max_sql_attempts=3)
+    result = graph.invoke({"messages": [HumanMessage(content="查订单")]})
+    assert len(calls) == 3
+    assert result["sql_attempts"] == 3
+    assert "硬上限" in result["messages"][-1].content
+    assert graph.execution_budget.snapshot()["query_calls"] == 3
+
+
+def test_each_query_in_one_tool_batch_consumes_its_own_budget():
+    calls = []
+
+    @tool
+    def query_file(sql: str) -> str:
+        """Record file query calls."""
+        calls.append(sql)
+        return "ok"
+
+    llm = FakeLLM(responses=[AIMessage(content="", tool_calls=[
+        {"name": "query_file", "args": {"sql": f"SELECT {i}"}, "id": f"q{i}"}
+        for i in range(5)
+    ])])
+    graph = make_graph(llm, [query_file])
+    result = graph.invoke({"messages": [HumanMessage(content="查文件")]})
+    assert len(calls) == 3
+    results = [m for m in result["messages"] if isinstance(m, ToolMessage)]
+    assert len(results) == 5
+    assert result["sql_attempts"] == 3
+
+
+def test_model_budget_stops_non_query_tool_loop_before_recursion_limit():
+    llm = FakeLLM(responses=[_tool_call("add", {"a": 1, "b": 2})])
+    graph = make_graph(llm, [add], max_model_calls=15)
+    result = graph.invoke({"messages": [HumanMessage(content="一直计算")]})
+    assert llm._i == 15
+    assert "模型调用已达到本轮硬上限 15" in result["messages"][-1].content
+
+
+def test_current_context_overflow_stops_before_model_call():
+    llm = FakeLLM(responses=[_answer("不得执行")])
+    graph = make_graph(llm, [add], max_context_tokens=100)
+    result = graph.invoke({"messages": [HumanMessage(content="长输入" * 2000)]})
+    assert llm._i == 0
+    assert "上下文预算不足" in result["messages"][-1].content

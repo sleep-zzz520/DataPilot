@@ -169,7 +169,8 @@ def _deser(role: str, content: str, extra_str: Optional[str]):
 #  公开 API
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def persist_messages(session_id: str, all_messages: list, user_id: Optional[int] = None) -> None:
+def persist_messages(session_id: str, all_messages: list, user_id: Optional[int] = None,
+                     *, pending_guard: bool = False) -> None:
     """将 all_messages 中尚未落盘的消息追加写入 SQLite（幂等）。
 
     用法：每轮对话结束后把内存 store 的完整历史传进来；
@@ -177,6 +178,8 @@ def persist_messages(session_id: str, all_messages: list, user_id: Optional[int]
 
     相比按 COUNT(*) 切片定位增量，本实现不受内存历史被裁剪
     （MAX_TURNS 截断）或并发写入的影响，不会丢消息、也不会 seq 冲突。
+    pending_guard 为新执行轮次原子保存“尚未通过门禁”的显示状态；最终结果由
+    persist_guarded_response 更新。这样进程在原始消息保存后中断也不会回放候选结论。
     """
     with _lock:
         conn = _conn()
@@ -230,6 +233,15 @@ def persist_messages(session_id: str, all_messages: list, user_id: Optional[int]
             next_seq = max_seq + 1
             for i, msg in enumerate(new_msgs):
                 role, content, extra = _ser(msg)
+                if pending_guard and role == "user":
+                    if not getattr(msg, "id", None):
+                        raise ValueError("pending_guard requires a stable user message id")
+                    metadata = json.loads(extra) if extra else {}
+                    metadata["display_override"] = {
+                        "status": "pending", "reply": "本轮分析尚未完成最终校验，请重新发起分析。",
+                        "visuals": [], "tables": [], "sql": None,
+                    }
+                    extra = json.dumps(metadata, ensure_ascii=False)
                 conn.execute(
                     "INSERT INTO messages(session_id, seq, role, content, extra) "
                     "VALUES (?,?,?,?,?)",
@@ -245,6 +257,42 @@ def persist_messages(session_id: str, all_messages: list, user_id: Optional[int]
                 f"UPDATE sessions SET {sets} WHERE id=?",
                 list(updates.values()) + [session_id],
             )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def persist_guarded_response(session_id: str, user_id: int, user_message_id: str,
+                             reply: str, *, visuals=(), tables=(), sql=None) -> None:
+    """Save only the final presentation while retaining original messages for audit.
+
+    Bind to the user message's stable id rather than the latest turn, so retries and
+    concurrent writes cannot change another turn's presentation. Ownership is checked.
+    """
+    presentation = {
+        "status": "final", "reply": reply or "", "visuals": list(visuals or []),
+        "tables": list(tables or []), "sql": sql,
+    }
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT m.id, m.extra FROM messages m JOIN sessions s ON s.id=m.session_id "
+                "WHERE m.session_id=? AND s.user_id IS ? AND m.role='user'",
+                (session_id, user_id),
+            ).fetchall()
+            target = None
+            for row in rows:
+                metadata = json.loads(row["extra"]) if row["extra"] else {}
+                if metadata.get("msg_id") == user_message_id:
+                    target = (row["id"], metadata)
+                    break
+            if target is None:
+                raise ValueError("No owned turn matches the user message id")
+            message_row_id, metadata = target
+            metadata["display_override"] = presentation
+            conn.execute("UPDATE messages SET extra=? WHERE id=?",
+                         (json.dumps(metadata, ensure_ascii=False), message_row_id))
             conn.commit()
         finally:
             conn.close()
@@ -612,6 +660,7 @@ def get_display_messages(session_id: str) -> List[Dict[str, Any]]:
                 if role == "user":
                     cur = {
                         "user_text": content,
+                        "display_override": extra.get("display_override"),
                         "assistant": None,   # 该轮最终回复（若有）
                         "sql": None,         # 该轮最后一次查询 SQL
                         "visuals": [],       # [{chart, image}] 该轮所有图表
@@ -659,6 +708,16 @@ def get_display_messages(session_id: str) -> List[Dict[str, Any]]:
             for t in turns:
                 if t["user_text"]:
                     result.append({"role": "user", "text": t["user_text"]})
+                override = t.get("display_override")
+                if isinstance(override, dict):
+                    entry = {"role": "assistant", "text": override.get("reply", ""),
+                             "sql": override.get("sql")}
+                    if override.get("visuals"):
+                        entry["visuals"] = override["visuals"]
+                    if override.get("tables"):
+                        entry["tables"] = override["tables"]
+                    result.append(entry)
+                    continue
                 a = t["assistant"]
                 if a is None:
                     # 该轮只有 tool 结果没有最终回复（异常中断）：合并成一条空消息兜底

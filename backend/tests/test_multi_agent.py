@@ -62,7 +62,7 @@ def _all_tools():
 def test_tool_name_groups_cover_all():
     names = {t.name for t in _all_tools()}
     grouped = set(SQL_TOOL_NAMES) | set(VIZ_TOOL_NAMES) | set(FILE_TOOL_NAMES) | set(STAT_TOOL_NAMES)
-    assert names == grouped  # 所有工具都归属某个专家，无遗漏
+    assert names == grouped - {"chart_from_evidence", "calculate_from_evidence"}
 
 
 def test_make_agent_registers_analysis_roles():
@@ -269,3 +269,84 @@ def test_validator_subgraph_uses_python_statistical_tool(monkeypatch):
                             if message.type == "tool" and message.name == "statistical_validator")
     assert "趋势统计已完成" in validator_result
     assert '"sample_size"' in validator_result and '"intermediate"' in validator_result
+
+
+def test_auto_route_is_explainable_and_explicit_modes_are_preserved():
+    from app.agent.multi_agent import decide_route
+    assert decide_route("统计本月订单总数")["selected_mode"] == "single"
+    assert decide_route("分析销售趋势")["selected_mode"] == "multi"
+    assert decide_route("分析销售趋势", mode="single")["selected_mode"] == "single"
+    plan = AnalysisPlan(goal="查询两期", steps=[
+        {"id": "a", "title": "本期", "kind": "query"},
+        {"id": "b", "title": "上期", "kind": "query"},
+    ])
+    assert decide_route("统计订单", PlanRuntime(plan))["selected_mode"] == "single"
+    from app.agent.analysis_plan import PlanStep
+    plan.steps.append(PlanStep(id="c", title="趋势统计", kind="calculate"))
+    assert "planned_statistical_validation" in decide_route("分析销售趋势", PlanRuntime(plan))["reasons"]
+    plan.data_sources = ["orders", "refunds"]
+    assert "multiple_sources" in decide_route("统计订单", PlanRuntime(plan))["reasons"]
+
+
+@pytest.mark.parametrize("mode", ["single", "multi"])
+def test_modes_reject_final_answer_without_actual_evidence(mode):
+    runtime = PlanRuntime(AnalysisPlan(goal="订单数", metrics=["订单数"]), "订单数")
+    llm = FakeLLM(responses=[AIMessage(content="订单一共999单")])
+    graph, _ = make_agent(llm, _all_tools(), plan_runtime=runtime, mode=mode, question="订单数")
+    result = graph.invoke({"messages": [HumanMessage(content="订单数")]})
+    assert "999" not in result["messages"][-1].content
+    assert runtime.validation_status == "rejected"
+    assert graph.route_decision["selected_mode"] == mode
+
+
+def test_single_mode_chart_cannot_bypass_validation():
+    calls = []
+
+    @tool
+    def make_chart() -> str:
+        """Create chart."""
+        calls.append("chart")
+        return "<!--CHART:{}-->"
+
+    runtime = PlanRuntime(AnalysisPlan(goal="订单图", metrics=["订单数"]), "订单图")
+    llm = FakeLLM(responses=[_tool_call("make_chart", {}), AIMessage(content="已画图")])
+    graph, _ = make_agent(llm, [make_chart], plan_runtime=runtime, mode="single")
+    result = graph.invoke({"messages": [HumanMessage(content="订单图")]})
+    assert not calls
+    assert any("图表已阻断" in m.content for m in result["messages"])
+    assert runtime.validation_status == "rejected"
+
+
+def test_supervisor_and_workers_share_model_budget():
+    runtime = PlanRuntime(AnalysisPlan(goal="统计订单", metrics=["订单数"]), "统计订单")
+    llm = FakeLLM(responses=[
+        _tool_call("data_executor", {"request": "查询订单"}),
+        AIMessage(content="执行摘要"),
+        AIMessage(content="不得启动第三次模型调用"),
+    ])
+    graph, _ = make_agent(llm, _all_tools(), plan_runtime=runtime,
+                          mode="multi", max_model_calls=2)
+    result = graph.invoke({"messages": [HumanMessage(content="订单数")]})
+    assert llm._i == 2
+    assert graph.execution_budget.snapshot()["model_calls"] == 2
+    assert "硬上限" in result["messages"][-1].content
+    assert runtime.validation_status == "rejected"
+    assert any("execution_stopped" in issue for issue in runtime.plan.quality_issues)
+
+
+def test_validator_context_stop_cannot_report_approved():
+    from app.agent.multi_agent import _make_validator_tool
+    runtime = PlanRuntime(AnalysisPlan(goal="统计", metrics=["订单数"]), "统计")
+    runtime.plan.evidence.append({"source": "query_mysql", "row_count": 1})
+    llm = FakeLLM(responses=[AIMessage(content="不得调用")])
+
+    @tool
+    def compare_periods_tool() -> str:
+        """Statistical calculation."""
+        return '{}'
+
+    validator = _make_validator_tool(runtime, llm, [compare_periods_tool], max_context_tokens=100)
+    result = validator.invoke({"request": "很长的计算输入" * 2000})
+    assert "统计验证：不通过" in result
+    assert runtime.validation_status == "rejected"
+    assert llm._i == 0

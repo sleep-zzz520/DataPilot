@@ -11,6 +11,7 @@ langchain-anthropic>=0.3.0,<1.0
 langgraph>=0.0.20,<1.0
 pydantic>=2.0.0,<3.0
 duckdb>=1.0.0  # 上传文件 SQL 查询
+sqlglot==30.27.0  # 指标契约 AST 语义校验；minor releases can break AST APIs
 pyjwt>=2.8.0   # 用户认证 JWT
 
 # 数据可视化

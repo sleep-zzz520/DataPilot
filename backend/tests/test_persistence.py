@@ -208,3 +208,49 @@ def test_delete_and_rename_session(isolated_storage):
 def test_session_scoped_by_user(isolated_storage):
     persist_messages("s1", [HumanMessage(content="q", id="1")], user_id=1)
     assert load_session("s1", user_id=2) == []  # 他人不可见
+
+
+def test_pending_guard_hides_raw_candidates_and_visuals_after_restart(isolated_storage):
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+    from app.persistence import persist_messages, get_display_messages, load_session
+    raw = [HumanMessage(content="统计订单", id="guard-user"),
+           ToolMessage(content='<!--CHART:{"type":"bar"}--><!--TABLE:{"rows":[[999]]}-->',
+                       tool_call_id="c", name="make_chart", id="guard-tool"),
+           AIMessage(content="候选结论999", id="guard-answer")]
+    persist_messages("guard-pending", raw, 7, pending_guard=True)
+    # Every read opens a new database connection, including the first after restart.
+    displayed = get_display_messages("guard-pending")
+    assert displayed[-1]["role"] == "assistant"
+    assert "999" not in displayed[-1]["text"]
+    assert not displayed[-1].get("visuals")
+    assert not displayed[-1].get("tables")
+    assert load_session("guard-pending", 7)[-1].content == "候选结论999"
+
+
+def test_guarded_response_overrides_one_owned_turn_and_keeps_audit(isolated_storage):
+    import pytest
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+    from app.persistence import (persist_messages, persist_guarded_response,
+                                 get_display_messages, load_session)
+    persist_messages("guard-final", [
+        HumanMessage(content="第一轮", id="turn-one"),
+        ToolMessage(content='<!--CHART:{"type":"bar"}-->', tool_call_id="a", id="tool-a"),
+        AIMessage(content="候选999", id="answer-a"),
+        HumanMessage(content="第二轮", id="turn-two"),
+        AIMessage(content="第二轮候选", id="answer-b"),
+    ], 7, pending_guard=True)
+    with pytest.raises(ValueError):
+        persist_guarded_response("guard-final", 8, "turn-one", "越权覆盖")
+    with pytest.raises(ValueError):
+        persist_guarded_response("guard-final", 7, "missing-id", "不存在的轮次")
+    persist_guarded_response("guard-final", 7, "turn-one", "本轮验证不通过")
+    persist_guarded_response("guard-final", 7, "turn-two", "真实结果120", visuals=[{"chart": {"type": "line"}}],
+                             tables=[{"rows": [[120]]}], sql="SELECT 120")
+    replies = [m for m in get_display_messages("guard-final") if m["role"] == "assistant"]
+    assert replies[0]["text"] == "本轮验证不通过"
+    assert not replies[0].get("visuals")
+    assert replies[1]["text"] == "真实结果120"
+    assert replies[1]["visuals"] == [{"chart": {"type": "line"}}]
+    assert replies[1]["tables"] == [{"rows": [[120]]}]
+    assert replies[1]["sql"] == "SELECT 120"
+    assert any(m.content == "候选999" for m in load_session("guard-final", 7))

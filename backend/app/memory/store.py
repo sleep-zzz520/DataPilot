@@ -1,6 +1,8 @@
 """基于内存的会话存储，支持 LRU 淘汰 + token 预算制截断。"""
 from __future__ import annotations
 
+import json
+import math
 import threading
 import time
 from collections import OrderedDict
@@ -20,34 +22,88 @@ SESSION_TTL_SECONDS = 4 * 3600
 
 
 def estimate_tokens(text) -> int:
-    """近似 token 估算：中文约 1 字≈1.5 token，其余约 4 字符≈1 token。
-
-    无 tokenizer 依赖的保守估算（偏大，宁可多裁）；纯函数可单测。
-    """
-    if not text:
+    """无 tokenizer 的保守近似，兼容多模态 content / 工具 JSON。"""
+    if text is None or text == "":
         return 0
-    # CJK 字符计 1.5，其余按 4 字符/token（ASCII 平均偏保守）
+    if not isinstance(text, str):
+        text = json.dumps(text, ensure_ascii=False, default=str, separators=(",", ":"))
     cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
-    other = len(text) - cjk
-    return max(1, int(cjk * 1.5 + other / 4))
+    return max(1, math.ceil(cjk * 1.5 + (len(text) - cjk) / 4))
+
+
+def estimate_message_tokens(message) -> int:
+    """计入角色封装、工具名/参数/ID，避免空 content 的调用被计作零。"""
+    payload = {"role": getattr(message, "type", "unknown"),
+               "content": getattr(message, "content", "")}
+    for field in ("tool_calls", "invalid_tool_calls", "tool_call_id", "name"):
+        value = getattr(message, field, None)
+        if value:
+            payload[field] = value
+    raw_calls = getattr(message, "additional_kwargs", {}).get("tool_calls")
+    if raw_calls and not payload.get("tool_calls"):
+        payload["tool_calls"] = raw_calls
+    return 6 + estimate_tokens(payload)
+
+
+def estimate_messages_tokens(messages: list) -> int:
+    return sum(estimate_message_tokens(message) for message in messages)
+
+
+def estimate_tool_tokens(tools) -> int:
+    """计入真正提供给模型的工具定义；复用 LangChain 已有序列化。"""
+    if not tools:
+        return 0
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+    schemas = [tool if isinstance(tool, dict) else convert_to_openai_tool(tool) for tool in tools]
+    return estimate_tokens(schemas) + 8
+
+
+def _tool_call_ids(message) -> list[str]:
+    calls = getattr(message, "tool_calls", None) or getattr(message, "additional_kwargs", {}).get("tool_calls", [])
+    return [str(call.get("id") or "") for call in calls]
+
+
+def protocol_groups(messages: list) -> list[list]:
+    """工具请求及全部响应为原子组；丢弃孤立响应及未完成的请求组。
+
+    只支持协议要求的紧邻工具响应。失败/中断的历史请求不能重新发给模型。
+    """
+    groups = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if isinstance(message, ToolMessage):
+            index += 1
+            continue
+        ids = _tool_call_ids(message) if isinstance(message, AIMessage) else []
+        if not ids:
+            groups.append([message])
+            index += 1
+            continue
+        end = index + 1
+        responses = []
+        while end < len(messages) and isinstance(messages[end], ToolMessage):
+            responses.append(str(messages[end].tool_call_id))
+            end += 1
+        if all(ids) and len(set(ids)) == len(ids) and sorted(responses) == sorted(ids):
+            groups.append(messages[index:end])
+        index = end
+    return groups
 
 
 def budget_history(messages: list, budget: int) -> list:
-    """按 token 预算从头部裁剪历史，保留最近的会话内容。
-
-    返回新的消息列表（不修改入参）；至少保留最后一条消息，避免空历史。
-    """
+    """按真实消息成本裁剪历史，严格服从预算并保护工具调用配对。"""
     if budget <= 0 or not messages:
-        return messages
-    keep: list = []
+        return []
+    keep = []
     used = 0
-    for m in reversed(messages):
-        cost = estimate_tokens(getattr(m, "content", None) or "")
-        if keep and used + cost > budget:
+    for group in reversed(protocol_groups(messages)):
+        cost = estimate_messages_tokens(group)
+        if used + cost > budget:
             break
-        keep.insert(0, m)
+        keep.append(group)
         used += cost
-    return keep
+    return [message for group in reversed(keep) for message in group]
 
 
 class ConversationStore:
@@ -128,13 +184,13 @@ class ConversationStore:
         """按 token 预算从头部裁剪（保留最近的会话内容）；轮数上限兜底。"""
         msgs = entry["messages"]
 
-        # 1) token 预算优先：总估算超预算时从头部删消息，直到预算内
-        total = sum(estimate_tokens(getattr(m, "content", None) or "") for m in msgs)
-        while total > self._max_tokens and len(msgs) > 1:
-            total -= estimate_tokens(getattr(msgs[0], "content", None) or "")
-            msgs.pop(0)
+        # 协议组为最小裁剪单元，预算为零时不能恢复整段历史。
+        entry["messages"] = msgs = budget_history(msgs, self._max_tokens)
 
         # 2) 轮数兜底：HumanMessage 条数 > max_turns 时仍裁剪（极端短消息场景）
+        if self._max_turns <= 0:
+            entry["messages"] = []
+            return
         human_count = sum(1 for m in msgs if isinstance(m, HumanMessage))
         if human_count <= self._max_turns:
             return

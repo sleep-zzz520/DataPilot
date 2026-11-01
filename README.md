@@ -7,7 +7,7 @@
 - **自然语言 → SQL**:Agent 自动完成库/表感知、SQL 生成与执行、报错自修正(最多 3 次重试),全程只读(SELECT)。
 - **上传文件真实分析**:上传 CSV/Excel 后,Agent 用 `query_file`(duckdb SQL)真实读取文件数据,不再靠预览猜测;支持分组统计、多图表可视化。
 - **多图表输出**:一轮对话可同时生成多张 ECharts 交互图 + matplotlib 静态图(此前只保留最后一张的问题已修复)。
-- **流式输出**:SSE 流式逐字返回,可实时看到回复生成过程。
+- **流式状态**:SSE 实时推送计划和工具轨迹；答复文字在最终质量门禁后发送，避免先展示未经验证的候选结论。
 - **Markdown 渲染**:AI 回复以规范排版显示(标题/列表/代码块/表格),原始 `# * -` 符号不裸露。
 - **配置中心**:
   - LLM 配置:支持 OpenAI / Anthropic / 通义千问 三家,选提供商自动填充接口地址,API Key 加密存储,保存后自动测试连接。
@@ -16,13 +16,15 @@
 - **用户账号与数据隔离**:开放注册/登录(JWT 认证),每个用户的会话与上传文件互相隔离;LLM/DB 配置全局共享(管理员配置一次即可)。
 - **可观测性**:结构化 JSON 日志(每个请求记录 method/path/status/耗时)、`/api/metrics` 请求数/错误率/耗时分位数(P50/P95/P99)、健康检查分 liveness(`/api/health`)与 readiness(`/api/health/ready`,检查 SQLite 与数据目录)。
 - **审计日志(合规留痕)**:SQL 查询(含上传文件查询)、LLM/DB 配置变更、用户操作(注册/登录/改密/角色变更/注销)、会话操作、文件上传全部留痕,只追加不可修改,detail 不含明文密钥;`/api/audit` 仅管理员可查(支持按 action/username 过滤)。
-- **token 用量计量(省钱)**:每轮 LLM 调用的 input/output token 与成本估算自动落库(内置 openai/anthropic/qwen 价格表,未知模型兜底估算);管理端报表 `/api/usage`(按天/按用户/按模型/明细);日/月预算配置与告警(超 80% 日志告警),chat 入口超限自动拒绝(BUDGET_LIMIT)。
+- **token 用量计量(省钱)**:规划、嵌套角色、记忆维护及晚到 Worker 的 input/output token 与成本估算自动落库(内置 openai/anthropic/qwen 价格表,未知模型兜底估算);管理端报表 `/api/usage`(按天/按用户/按模型/明细);日/月预算配置与告警(超 80% 日志告警),chat 入口超限自动拒绝(BUDGET_LIMIT)。
 - **上下文压缩(省钱+丝滑)**:token 预算制截断替代纯轮数截断(默认 8k token 预算,按近似估算从头部裁剪历史,保留最近对话);长工具输出压缩(query 结果 markdown 最多展示 50 行并提示省略,前端表格仍完整)。
 - **显式 Agent 图编排(核心能力)**:手写 LangGraph StateGraph 替代 create_react_agent 黑盒——`agent`(LLM 决策,逐 token 流式)/`tools`(执行工具调用)节点 + 条件边;状态含 `sql_attempts` 轻量反思(查询工具连续失败达上限自动注入提示强制收敛,防死循环);节点/状态全显式可观测,为轨迹可视化打基础。
-- **多智能体协作(核心能力)**:Supervisor 主管-专家架构——主管 Agent 按任务分派给 SQL 专家(查库)/可视化专家(出图)/文件专家(上传文件分析),每个专家是独立显式子图(自己的工具集 + 专家 prompt),主管可串联多专家(先查库再画图);无上传文件时自动降级为 2 专家,专家过少回退单 Agent。
-- **Agent 记忆(核心能力)**:三件套——①长期记忆:LLM 从对话提取用户偏好/常用库等跨会话事实(信号词触发 + 10 分钟节流防烧钱),每次对话自动注入;②会话摘要:每 5 轮用 LLM 压缩历史为结构化摘要,新会话快速定位;③记忆检索:按用户问题关键词从历史消息按需检索注入(纯规则零成本),替代整段重放。
+- **按需 Agent 编排(核心能力)**:支持 `auto/single/multi`；简单分析由单 Agent 执行，多数据源或计划中的复杂统计按需启用 Supervisor 与数据执行、统计验证、洞察表达角色。两种模式共用证据门禁和模型/工具/查询预算，响应返回可解释的路由原因。
+- **记忆与上下文(核心能力)**:SQLite 保留原始历史；摘要累计合并未覆盖消息并保存断点，工具调用与完整响应按原子组裁剪。相关记忆在规划前注入；长期偏好按数据域和版本管理，明确纠正可及时更新。统一估算系统规则、历史、当前问题、工具定义与输出预留。
 - **Agent 轨迹可视化(核心能力)**:每条回复下方展示本轮完整工具调用链(主管→专家→工具 层级时间线,含入参/结果摘要、状态、耗时);SSE 实时增量推送 + SQLite 落库,重开会话可回放;基于显式图"节点埋点"实现,不侵入工具。
 - **UI**:白黑主题、通栏布局(会话栏贴左、对话区贴右)。
+
+- **指标契约与局部修复**:已启用的服务端指标定义约束公式、过滤、粒度、单位和数据源；SQL AST 校验失败后进入有上限的局部修复，缺少必要数据时澄清。统计和图表按证据 ID 读取数据。默认注册表为空，配置方式见下文。
 
 ## 🧱 技术栈
 
@@ -127,12 +129,12 @@ npm run dev
 ## 🧪 自动化测试
 
 ```bash
-# 后端 pytest（核心逻辑单测 + 认证接口集成，248 例）
+# 后端 pytest（核心逻辑单测 + 认证接口集成，461 例）
 cd backend
 pip install -r requirements-dev.txt   # 首次
 python -m pytest tests/
 
-# 前端 vitest（拦截器 / SSE 解析 / 组件 / 路由守卫 / store，26 例）
+# 前端 vitest（拦截器 / SSE 解析 / 组件 / 路由守卫 / store，34 例）
 cd frontend
 npm install          # 首次
 npm test
@@ -156,6 +158,14 @@ npm test
 | `generate_chart` | 高级图表(8 种:bar/line/pie/scatter/histogram/boxplot/area/heatmap) |
 | `auto_analyze_and_visualize` | 自动选型 + 统计摘要 |
 | `list_files` / `query_file` / `file_stats` | 上传文件结构、SQL 查询(duckdb)、统计摘要 |
+
+## 指标契约配置
+
+服务端从 `backend/config/metric_contracts.json` 加载可信定义。默认未启用指标，旧请求保留原行为；示例位于 `backend/config/metric_contracts.example.json`。业务方确认公式、成本税费口径、字段、单位及适用数据源后，配置 `contracts`、`enabled_contract_ids` 和 `source_bindings`。聊天 API 可通过 `metric_contract_ids` 选择已启用的 ID，不能从请求覆盖公式。
+
+文件源使用 `df` 并绑定上传文件名，当前契约模式每请求支持一个明确文件；MySQL 源使用 `schema.table` 并绑定数据库配置 ID。定义变更会使未消费的旧审批失效。支持平面 SELECT 及具备受信约束与唯一键证明的 LEFT JOIN；未支持的 SQL 结构保守拒绝或澄清，不保证任意 SQL 等价。
+
+执行轨迹包含结构化校验错误和 `local_repair` 节点；统计、图表通过 `calculate_from_evidence` / `chart_from_evidence` 消费有效证据，过期和截断证据会被拦截。
 
 ## ⚠️ 注意事项
 

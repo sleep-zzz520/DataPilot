@@ -12,7 +12,7 @@ from app.core.timeouts import (
     LLM_REQUEST_TIMEOUT_SECONDS,
 )
 
-def _llm_fp(o): return (o.get("id"), o.get("provider"), o.get("base_url"), o.get("model_name"), o.get("temperature", 0))
+def _llm_fp(o): return (o.get("id"), o.get("provider"), o.get("base_url"), o.get("model_name"), o.get("temperature", 0), o.get("max_tokens"), o.get("reasoning_effort"))
 def _db_fp(o):  return (o.get("id"), o.get("host"), o.get("port"), o.get("username"), o.get("default_schema"))
 
 _llm_cache, _db_cache = {}, {}
@@ -44,7 +44,8 @@ def mysql_engine_options():
         },
     }
 
-def build_llm_from(provider, model_name, api_key, base_url, temperature=0, max_tokens=None):
+def build_llm_from(provider, model_name, api_key, base_url, temperature=0, max_tokens=None,
+                   reasoning_effort=None):
     """按提供商构建 LLM 实例。
     - openai / qwen：OpenAI 兼容接口（ChatOpenAI）
     - anthropic：官方 Anthropic SDK（ChatAnthropic）
@@ -62,6 +63,14 @@ def build_llm_from(provider, model_name, api_key, base_url, temperature=0, max_t
             max_retries=LLM_MAX_RETRIES,
         )
     # openai / qwen 统一走 OpenAI 兼容协议
+    options = {}
+    if str(model_name or "").lower().startswith("glm-5.3"):
+        # GLM-5.3 always thinks; provider default=max can exhaust short I/O budgets.
+        # https://docs.z.ai/api-reference/llm/chat-completion
+        effort = reasoning_effort or "low"
+        if effort not in {"low", "high", "max"}:
+            raise ValueError("GLM-5.3 reasoning_effort must be low, high or max")
+        options["extra_body"] = {"thinking": {"type": "enabled"}, "reasoning_effort": effort}
     return ChatOpenAI(
         model=model_name,
         api_key=api_key,
@@ -70,6 +79,7 @@ def build_llm_from(provider, model_name, api_key, base_url, temperature=0, max_t
         max_tokens=max_tokens or None,
         timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         max_retries=LLM_MAX_RETRIES,
+        **options,
     )
 
 def build_llm(o):
@@ -82,6 +92,7 @@ def build_llm(o):
         base_url=o.get("base_url"),
         temperature=o.get("temperature", 0),
         max_tokens=o.get("max_tokens"),
+        reasoning_effort=o.get("reasoning_effort"),
     )
     _llm_cache[fp] = c
     return c

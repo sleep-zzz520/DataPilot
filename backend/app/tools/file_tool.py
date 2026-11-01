@@ -50,6 +50,10 @@ def _query_dataframe(df: pd.DataFrame, sql: str) -> tuple[str, int]:
     machine = {
         "columns": list(result.columns),
         "rows": result.head(200).where(result.notna(), None).values.tolist(),
+        "executed_sql": sql,
+        "source": "df",
+        "row_count_total": len(result),
+        "truncated": len(result) > 200,
     }
     return (
         _to_md(result, max_rows=_TOOL_MAX_ROWS)

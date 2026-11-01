@@ -45,6 +45,20 @@ def test_default_provider_is_openai():
     assert isinstance(build_llm_from(None, "gpt-4o-mini", "sk-1", None), ChatOpenAI)
 
 
+def test_glm_flash_forced_thinking_uses_bounded_effort():
+    llm = build_llm_from("openai", "glm-5.3-Flash", "test", None)
+    assert llm.extra_body == {"thinking": {"type": "enabled"}, "reasoning_effort": "low"}
+    with pytest.raises(ValueError):
+        build_llm_from("openai", "glm-5.3-Flash", "test", None, reasoning_effort="none")
+
+
+def test_model_cache_changes_with_output_and_reasoning_limits():
+    cfg = {"id": 987, "model_name": "glm-5.3-Flash", "api_key": "test"}
+    original = build_llm(cfg)
+    assert build_llm({**cfg, "reasoning_effort": "high"}) is not original
+    assert build_llm({**cfg, "max_tokens": 512}) is not original
+
+
 def test_provider_default_base_urls():
     assert "openai" in PROVIDER_DEFAULT_BASE_URL
     assert "anthropic" in PROVIDER_DEFAULT_BASE_URL

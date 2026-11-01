@@ -107,7 +107,9 @@ def make_tools(engine, default_schema=None, files=None, audit_ctx=None, file_pat
                 _audit_sql(sql, len(df), "mysql")
             d2 = df.head(200)
             machine = {"columns": list(df.columns),
-                       "rows": d2.where(d2.notna(), None).values.tolist()}
+                       "rows": d2.where(d2.notna(), None).values.tolist(),
+                       "executed_sql": sql, "source": "mysql",
+                       "row_count_total": len(df), "truncated": len(df) > 200}
             return _to_md(df, max_rows=_TOOL_MAX_ROWS) + f"\n<!--TABLE:{json.dumps(machine, ensure_ascii=False, default=str)}-->"
         except Exception as e:
             if _is_timeout_error(e):
