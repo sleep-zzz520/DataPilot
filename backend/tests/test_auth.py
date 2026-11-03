@@ -122,14 +122,14 @@ def test_user_role_management(client):
     assert client.put(f"/api/auth/users/{admin['id']}", json={"role": "user"},
                       headers=admin_h).status_code == 400
 
-    # 提升 worker1 为 admin；角色在 JWT 里，旧 token 需重新登录才生效
+    # 已签发的 token 也使用当前账号角色
     worker = next(u for u in users.json() if u["username"] == "worker1")
     assert client.put(f"/api/auth/users/{worker['id']}", json={"role": "admin"},
                       headers=admin_h).status_code == 200
-    relogin = client.post("/api/auth/login", json={"username": "worker1", "password": "pass1234"})
-    assert relogin.json()["role"] == "admin"
-    new_user_h = {"Authorization": f"Bearer {relogin.json()['token']}"}
-    assert client.get("/api/auth/users", headers=new_user_h).status_code == 200
+    assert client.get("/api/auth/users", headers=user_h).status_code == 200
+    assert client.put(f"/api/auth/users/{worker['id']}", json={"role": "user"},
+                      headers=admin_h).status_code == 200
+    assert client.get("/api/auth/users", headers=user_h).status_code == 403
 
 
 def test_change_password(client):
@@ -154,5 +154,4 @@ def test_delete_account(client, isolated_storage):
     assert client.delete("/api/auth/account", headers=h).status_code == 200
     # 账号已删：无法再登录，也不再出现在用户列表
     assert client.post("/api/auth/login", json={"username": "ghost", "password": "pass1234"}).status_code == 401
-    users = client.get("/api/auth/users", headers=h).json()
-    assert all(u["username"] != "ghost" for u in users)
+    assert client.get("/api/auth/users", headers=h).status_code == 401

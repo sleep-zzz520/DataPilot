@@ -1,4 +1,4 @@
-"""运行离线分析评测：python -m app.evaluation"""
+"""运行静态评分器回归（预填预测，不运行 Agent）：python -m app.evaluation"""
 from __future__ import annotations
 
 import argparse
@@ -10,19 +10,23 @@ from app.evaluation.evaluator import evaluate_dataset, load_cases
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="运行 DataAnalysis Agent 离线评测集")
-    parser.add_argument("--cases", help="评测集 JSON 路径，默认使用内置黄金样例")
+    parser = argparse.ArgumentParser(description="运行预填预测的静态评分器回归，不调用 Agent 或模型")
+    parser.add_argument("--cases", help="评测集 JSON 路径，默认使用内置评分器样例")
     parser.add_argument("--output", help="可选：将完整 JSON 报告写入文件")
     parser.add_argument("--min-rate", type=float, default=1.0,
                         help="四项指标最低通过率，默认 1.0（CI 回归门禁）")
     args = parser.parse_args(argv)
 
     report = evaluate_dataset(load_cases(args.cases))
+    report["evaluation_kind"] = "static_scorer_regression"
+    report["agent_executed"] = False
     if args.output:
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({
+        "evaluation_kind": report["evaluation_kind"],
+        "agent_executed": False,
         "case_count": report["case_count"],
         "overall_rate": report["overall_rate"],
         "metrics": report["metrics"],

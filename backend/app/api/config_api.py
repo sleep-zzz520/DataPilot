@@ -1,9 +1,9 @@
 # app/api/config_api.py —— 对接加密版 store
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictInt
 from typing import Optional
 from app.meta import store
-from app.meta import crypto
+from app.persistence import list_users
 from app.audit import record, A_CONFIG_CHANGE
 from app.api.auth_api import get_current_user
 
@@ -85,11 +85,11 @@ def delete_llm(cfg_id: int, user: dict = Depends(get_current_user)):
 # ---------- DB ----------
 @router.get("/db")
 def list_db(user: dict = Depends(get_current_user)):
-    return store.list_db_configs()
+    return store.list_db_configs(user=user)
 
 @router.get("/db/{cfg_id}")
 def get_db(cfg_id: int, user: dict = Depends(get_current_user)):
-    cfg = store.get_db_config(cfg_id)
+    cfg = store.get_db_config(cfg_id, user=user)
     if not cfg: raise HTTPException(404, "DB config not found")
     return cfg
 
@@ -122,6 +122,33 @@ def delete_db(cfg_id: int, user: dict = Depends(get_current_user)):
            {"type": "db", "action": "delete", "id": cfg_id})
     return {"ok": True}
 
+class DBGrants(BaseModel):
+    user_ids: list[StrictInt]
+
+
+@router.get("/db/{cfg_id}/grants")
+def get_db_grants(cfg_id: int, user: dict = Depends(get_current_user)):
+    _require_admin(user)
+    user_ids = store.get_db_grants(cfg_id)
+    if user_ids is None:
+        raise HTTPException(404, "DB config not found")
+    return {"user_ids": user_ids}
+
+
+@router.put("/db/{cfg_id}/grants")
+def replace_db_grants(cfg_id: int, req: DBGrants, user: dict = Depends(get_current_user)):
+    _require_admin(user)
+    known_ids = {account["id"] for account in list_users()}
+    if set(req.user_ids) - known_ids:
+        raise HTTPException(400, "存在未知用户 ID")
+    user_ids = store.replace_db_grants(cfg_id, req.user_ids)
+    if user_ids is None:
+        raise HTTPException(404, "DB config not found")
+    record(A_CONFIG_CHANGE, user["uid"], user.get("username"),
+           {"type": "db", "action": "replace_grants", "id": cfg_id, "user_ids": user_ids})
+    return {"user_ids": user_ids}
+
+
 # ---------- Test Connection ----------
 @router.post("/llm/test")
 def test_llm(req: LLMConfigSave, user: dict = Depends(get_current_user)):
@@ -149,6 +176,7 @@ def test_llm(req: LLMConfigSave, user: dict = Depends(get_current_user)):
 @router.post("/db/test")
 def test_db(req: DBConfigSave, user: dict = Depends(get_current_user)):
     """测试连接用真实 password"""
+    _require_admin(user)
     from sqlalchemy import create_engine, text
     from app.core.factories import mysql_engine_options
     password = req.password

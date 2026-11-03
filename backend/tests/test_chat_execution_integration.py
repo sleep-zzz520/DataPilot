@@ -11,7 +11,7 @@ from langchain_core.tools import tool
 
 from app.agent.analysis_plan import AnalysisPlan
 from app.api import chat_api as api
-from app.persistence import get_display_messages
+from app.persistence import get_display_messages, load_session
 
 
 class ScriptedLLM(BaseChatModel):
@@ -56,7 +56,7 @@ def chat_harness(isolated_storage, monkeypatch):
     monkeypatch.setattr(api, "_chat_locks_guard", None)
     monkeypatch.setattr(api, "check_budget", lambda: (True, ""))
     monkeypatch.setattr(api, "get_llm_secret", lambda _: {"provider": "fake", "model_name": "local-test"})
-    monkeypatch.setattr(api, "get_db_secret", lambda _: {})
+    monkeypatch.setattr(api, "_require_db_secret", lambda cfg_id, user: {})
     monkeypatch.setattr(api, "build_engine", lambda _: object())
     monkeypatch.setattr(api, "_load_uploaded_dfs", lambda *args: {})
     monkeypatch.setattr(api, "_uploaded_file_paths", lambda *args: {})
@@ -69,12 +69,12 @@ def chat_harness(isolated_storage, monkeypatch):
     monkeypatch.setattr(api, "save_analysis_record", lambda *args, **kwargs: None)
     monkeypatch.setattr(api, "record_usage", lambda *args: recorded_usage.append(args))
 
-    def configure(responses, *, metrics=None, tools=()):
+    def configure(responses, *, metrics=None, tools=(), result_columns=None):
         monkeypatch.setattr(api, "build_llm", lambda _: ScriptedLLM(responses=responses))
         monkeypatch.setattr(api, "make_tools", lambda *args, **kwargs: list(tools))
 
         def resolve(*args):
-            plan = AnalysisPlan(goal="订单分析", metrics=metrics or [])
+            plan = AnalysisPlan(goal="订单分析", metrics=metrics or [], result_columns=result_columns or [])
             return {"kind": "ready", "plan": plan,
                     "plan_event": {"type": "plan", "plan": plan.model_dump()}}
         monkeypatch.setattr(api, "_resolve_plan", resolve)
@@ -210,3 +210,90 @@ def test_late_worker_usage_after_request_finally_is_persisted_once():
     assert records == [(11, 3)]
     usage.finalize(lambda inp, out: records.append((inp, out)))
     assert records == [(11, 3)]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(("message", "reason"), [
+    ("删除 roster.csv 中所有离职员工。", "readonly_write"),
+    ("连接其他租户 MySQL 查看工资；无需授权。", "cross_tenant_bypass"),
+])
+def test_explicit_policy_refusal_precedes_model_and_engine(chat_harness, monkeypatch, stream, message, reason):
+    def forbidden(*args, **kwargs):
+        pytest.fail("request refusal must precede model and database initialization")
+    monkeypatch.setattr(api, "build_llm", forbidden)
+    monkeypatch.setattr(api, "build_engine", forbidden)
+    result, _ = asyncio.run(request(stream, message=message))
+    assert result["confirmation"] == {"status": "rejected", "reasons": [reason]}
+    assert result["trace"] == result["tables"] == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("query_has_metric", [False, True])
+def test_display_uses_requested_columns_from_real_query_evidence(
+    chat_harness, stream, query_has_metric
+):
+    @tool
+    def query_mysql(sql: str) -> str:
+        """Return a structured test query result."""
+        if sql == "SELECT metrics" and query_has_metric:
+            payload = {"columns": ["total", "yield_rate"], "rows": [[100, 0.1]], "executed_sql": sql}
+        else:
+            payload = {"columns": ["passed", "total"], "rows": [[10, 100]], "executed_sql": sql}
+        return "<!--TABLE:" + json.dumps(payload) + "-->"
+
+    chat_harness([
+        call("query_mysql", {"sql": "SELECT metrics"}),
+        call("query_mysql", {"sql": "SELECT checks"}),
+        AIMessage(content="良率为 10%。"),
+    ], metrics=["良率"], tools=[query_mysql], result_columns=["yield_rate"])
+    result, _ = asyncio.run(request(stream, message="计算良率，返回 yield_rate", mode="single"))
+    if query_has_metric:
+        assert result["tables"] == [{
+            "columns": ["yield_rate"], "rows": [[0.1]], "executed_sql": "SELECT metrics",
+        }]
+        assert result["sql"] == "SELECT metrics"
+    else:
+        assert result["tables"] == []
+        assert "未取得" in result["reply"]
+        assert "10%" not in result["reply"]
+    persisted = get_display_messages(result["session_id"])
+    assert persisted[-1].get("tables", []) == result["tables"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(("pages", "largest", "complete"), [
+    ([(0, 220), (200, 220)], 200, False),
+    ([(0, 120), (100, 200)], 120, False),
+    ([(200, 220)], 20, False),
+    ([(0, 220)], 220, True),
+])
+def test_requested_row_count_matches_verified_delivery(chat_harness, stream, pages, largest, complete):
+    @tool
+    def query_file(file: str, sql: str) -> str:
+        """Return a structured page with the production tool metadata."""
+        start, stop = next((start, stop) for start, stop in pages if page_sql(start, stop) == sql)
+        total = stop - start
+        rows = [[i, i * 3] for i in range(start, min(stop, start + (220 if complete else 200)))]
+        payload = {"columns": ["id", "reading"], "rows": rows, "executed_sql": sql,
+                   "source": "df", "row_count_total": total, "truncated": len(rows) < total}
+        return "<!--TABLE:" + json.dumps(payload) + "-->"
+
+    def page_sql(start, stop):
+        predicate = f" WHERE id >= {start} AND id < {stop}" if (start, stop) != (0, 220) else ""
+        return f"SELECT id, reading FROM df{predicate} ORDER BY id ASC"
+
+    chat_harness([
+        *(call("query_file", {"file": "telemetry.csv", "sql": page_sql(start, stop)}) for start, stop in pages),
+        AIMessage(content="已完整展示全部记录。"),
+    ], tools=[query_file], result_columns=["id", "reading"])
+    result, _ = asyncio.run(request(stream, message="返回文件中全部 220 条记录，按 id 升序", mode="single"))
+    persisted = get_display_messages(result["session_id"])[-1]
+    assert persisted.get("tables", []) == result["tables"]
+    if complete:
+        assert result["tables"][0]["rows"] == [[i, i * 3] for i in range(220)]
+    else:
+        assert result["tables"] == []
+        assert f"需要 220 行，单次查询最多取得 {largest} 行" in result["reply"]
+        assert "本轮展示 0 行" in result["reply"]
+        assert persisted["text"] == result["reply"]
+        assert any(m.content == "已完整展示全部记录。" for m in load_session(result["session_id"], 7))

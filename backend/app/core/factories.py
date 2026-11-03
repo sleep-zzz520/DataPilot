@@ -45,7 +45,7 @@ def mysql_engine_options():
     }
 
 def build_llm_from(provider, model_name, api_key, base_url, temperature=0, max_tokens=None,
-                   reasoning_effort=None):
+                   reasoning_effort=None, *, request_timeout=LLM_REQUEST_TIMEOUT_SECONDS):
     """按提供商构建 LLM 实例。
     - openai / qwen：OpenAI 兼容接口（ChatOpenAI）
     - anthropic：官方 Anthropic SDK（ChatAnthropic）
@@ -59,7 +59,7 @@ def build_llm_from(provider, model_name, api_key, base_url, temperature=0, max_t
             base_url=url,
             temperature=float(temperature or 0),
             max_tokens=max_tokens or 4096,
-            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+            timeout=request_timeout,
             max_retries=LLM_MAX_RETRIES,
         )
     # openai / qwen 统一走 OpenAI 兼容协议
@@ -77,14 +77,14 @@ def build_llm_from(provider, model_name, api_key, base_url, temperature=0, max_t
         base_url=url,
         temperature=float(temperature or 0),
         max_tokens=max_tokens or None,
-        timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+        timeout=request_timeout,
         max_retries=LLM_MAX_RETRIES,
         **options,
     )
 
-def build_llm(o):
+def build_llm(o, *, request_timeout=None):
     fp = _llm_fp(o)
-    if fp in _llm_cache: return _llm_cache[fp]
+    if request_timeout is None and fp in _llm_cache: return _llm_cache[fp]
     c = build_llm_from(
         provider=o.get("provider"),
         model_name=o.get("model_name"),
@@ -93,8 +93,10 @@ def build_llm(o):
         temperature=o.get("temperature", 0),
         max_tokens=o.get("max_tokens"),
         reasoning_effort=o.get("reasoning_effort"),
+        request_timeout=LLM_REQUEST_TIMEOUT_SECONDS if request_timeout is None else request_timeout,
     )
-    _llm_cache[fp] = c
+    if request_timeout is None:
+        _llm_cache[fp] = c
     return c
 
 def build_engine(o):

@@ -91,3 +91,26 @@ def test_plan_runtime_rejects_failed_query_even_without_quality_issue():
     report = runtime.validate_evidence()
     assert report["status"] == "rejected"
     assert "数据执行步骤失败" in report["issues"]
+
+
+def test_unconstrained_plan_accepts_real_evidence_without_where_or_order_by():
+    sql = "SELECT SUM(amount) AS total FROM df"
+    table = '<!--TABLE:{"columns":["total"],"rows":[[230]]}-->'
+    for sort, time_range in [
+        ([], {"type": "all"}), ("无", "全部数据"),
+        (None, {"start": None, "end": None}),
+        ("无需排序", {"type": "all", "start": None, "end": None}),
+        (None, {"type": "all", "description": "未指定时间范围，统计全部数据"}),
+    ]:
+        plan = AnalysisPlan(goal="汇总金额", metrics=["总额"], sort=sort, time_range=time_range)
+        runtime = PlanRuntime(plan)
+        assert runtime.after_tool("query_file", {"sql": sql}, table) == []
+        assert runtime.validate_evidence()["status"] == "approved"
+
+    constrained = AnalysisPlan(goal="查询一月金额", metrics=["总额"],
+                               sort=[{"column": "total"}],
+                               time_range={"type": "all", "start": "2026-01-01"})
+    runtime = PlanRuntime(constrained)
+    issues = runtime.after_tool("query_file", {"sql": sql}, table)
+    assert "查询未体现计划中的时间范围" in issues
+    assert "查询未体现计划要求的排序" in issues

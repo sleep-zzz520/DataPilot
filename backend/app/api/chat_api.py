@@ -28,7 +28,7 @@ from app.db.schema import list_tables
 from app.agent.analysis_plan import AnalysisPlan, make_analysis_plan_graph, PlanRuntime, plan_context
 from app.agent.contracts import MetricContractRegistry, ContractBinding, ValidationIssue, bind_metric_contracts
 from app.agent.contract_catalog import load_contract_catalog
-from app.agent.hitl import assess_confirmation
+from app.agent.hitl import assess_confirmation, request_refusal
 from app.memory import get_history, save_messages, clear_session
 from app.memory.store import budget_history, estimate_tokens, MAX_TOKENS
 from app.agent.graph import _filter_new_messages
@@ -253,6 +253,18 @@ def _audit_hitl(user: dict, sid: str, status: str, confirmation: dict,
     })
 
 
+def _request_refusal_response(req: ChatRequest, sid: str, user: dict) -> Optional[dict]:
+    refusal = request_refusal(req.message)
+    if refusal is None:
+        return None
+    reason, reply = refusal
+    confirmation = {"status": "rejected", "reasons": [reason]}
+    _audit_hitl(user, sid, "policy_refused", confirmation)
+    return {"reply": reply, "visuals": [], "tables": [], "chart": None, "table": None,
+            "sql": None, "session_id": sid, "confirmation": confirmation,
+            "plan": None, "evidence": [], "trace": []}
+
+
 def _resolve_plan(req: ChatRequest, sid: str, llm, engine, schema: Optional[str], user: dict) -> dict:
     """计划生成后的执行门禁；返回 ready/confirmation/rejected，拒绝不创建工具调用。"""
     request_hash = _request_hash(req, sid)
@@ -319,18 +331,17 @@ def _resolve_plan(req: ChatRequest, sid: str, llm, engine, schema: Optional[str]
 _TIMEOUT_MARKERS = ("超时", "timeout")
 
 
-def _guard_reply(reply: str, plan, validation_status: Optional[str] = None) -> str:
+def _guard_reply(reply: str, plan, validation_status: Optional[str] = None, *, tool_timed_out=False) -> str:
     """质量校验未通过时，把限制明确呈现给用户，避免模型只给确定性结论。"""
     warnings = list(dict.fromkeys(plan.quality_issues))
+    if validation_status and validation_status != "approved" and (
+        tool_timed_out or any(mark in item for item in warnings for mark in _TIMEOUT_MARKERS)
+    ):
+        return (
+            "本轮分析在等待查询或验证时超时，未能完成校验，因此暂不给出确定性结论。"
+            "建议缩小查询范围（例如限定时间区间或减少分组）后重试。"
+        )
     if plan.metrics and validation_status and validation_status != "approved":
-        # 区分"超时"与"数据质量问题"：前者用户能自救（重试 / 缩小范围），
-        # 后者需要用户调整口径。混在一起会让用户误以为数据本身有问题。
-        timeouts = [item for item in warnings if any(mark in item for mark in _TIMEOUT_MARKERS)]
-        if timeouts:
-            return (
-                "本轮分析在等待查询或验证时超时，未能完成校验，因此暂不给出确定性结论。"
-                "建议缩小查询范围（例如限定时间区间或减少分组）后重试。"
-            )
         detail = "；".join(warnings) if warnings else "尚未完成真实证据的统计验证"
         return "本轮统计验证未通过，暂不生成确定性结论。原因：" + detail + "。"
     if warnings:
@@ -365,6 +376,25 @@ def _extract(messages):
                     sql = tc.get("args", {}).get("sql") or sql
     return visuals, tables, sql
 
+def _display_result(messages, reply, runtime, trace=()):
+    visuals, tables, sql = _extract(messages)
+    status = runtime.validation_status
+    if status != "approved":
+        visuals, tables = [], []
+    reply = _guard_reply(reply, runtime.plan, status,
+                         tool_timed_out=any(entry.get("status") == "timeout" for entry in trace))
+    table, delivery_issue = runtime.result_delivery()
+    if delivery_issue:
+        return delivery_issue, [], [], None
+    if table is not None:
+        tables = [table]
+        sql = table.get("executed_sql")
+    elif status == "approved" and runtime.plan.result_columns:
+        columns = "、".join(runtime.plan.result_columns)
+        return f"本轮未取得包含所需列（{columns}）的完整查询结果，暂不提供结论。", [], [], None
+    return reply, visuals, tables, sql
+
+
 # ── 辅助：若内存 store 无该 session 但 SQLite 有，则从 SQLite 恢复 ──────────
 def _ensure_loaded(sid: str, user_id: Optional[int]) -> None:
     """保证内存 store 中有该 session 的历史（从 SQLite 懒加载，校验归属）。"""
@@ -394,6 +424,7 @@ def _record_request_usage(usage, req, sid, user):
 
 @router.post("/api/chat")
 async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
+    db_cfg = _require_db_secret(req.db_config_id, user)
     sid = req.session_id or str(uuid.uuid4())
     _ensure_session_access(req.session_id, user["uid"])
     lock = await _session_lock(sid)
@@ -406,6 +437,9 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
                 return {"reply": None, "chart": None, "table": None, "sql": None, "session_id": sid,
                         "error": {"code": "DUPLICATE_REQUEST", "message": "重复提交",
                                   "suggestion": dup, "severity": "warn"}}
+            refusal = _request_refusal_response(req, sid, user)
+            if refusal is not None:
+                return refusal
             # ── 预算限流：超限直接拒绝，不调 LLM ──────────────────────────
             ok, reason = check_budget()
             if not ok:
@@ -414,7 +448,6 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
                                   "suggestion": reason, "severity": "block"}}
             usage = RequestUsage()
             llm = with_request_usage(build_llm(get_llm_secret(req.llm_config_id)), usage)
-            db_cfg = get_db_secret(req.db_config_id)
             engine = build_engine(db_cfg)
             resolution = _resolve_plan(req, sid, llm, engine, db_cfg.get("default_schema"), user)
             plan = resolution.get("plan")
@@ -485,11 +518,8 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             save_trace(sid, trace.snapshot(), user["uid"])
 
             msgs = result_messages
-            visuals, tables, sql = _extract(new_msgs)
-            if runtime.validation_status != "approved":
-                visuals, tables = [], []
             reply = msgs[-1].content if isinstance(msgs[-1], AIMessage) else ""
-            reply = _guard_reply(reply, plan, runtime.validation_status)
+            reply, visuals, tables, sql = _display_result(new_msgs, reply, runtime, trace.snapshot())
             persist_guarded_response(sid, user["uid"], user_msg.id, reply,
                                      visuals=visuals, tables=tables, sql=sql)
 
@@ -536,6 +566,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         confirmation 字段存在时表示已暂停，必须带 approval_id + approval_decision 重试
       - error: {"type":"error","error":{...},"session_id"}                 异常
     """
+    db_cfg = _require_db_secret(req.db_config_id, user)
     sid = req.session_id or str(uuid.uuid4())
     _ensure_session_access(req.session_id, user["uid"])
     lock = await _session_lock(sid)
@@ -552,6 +583,10 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                                           "suggestion": dup, "severity": "warn"},
                                 "session_id": sid})
                     return
+                refusal = _request_refusal_response(req, sid, user)
+                if refusal is not None:
+                    yield _sse({"type": "done", **refusal})
+                    return
                 # ── 预算限流：超限直接拒绝，不调 LLM ──────────────────────
                 ok, reason = check_budget()
                 if not ok:
@@ -562,7 +597,6 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                     return
                 usage = RequestUsage()
                 llm = with_request_usage(build_llm(get_llm_secret(req.llm_config_id)), usage)
-                db_cfg = get_db_secret(req.db_config_id)
                 engine = build_engine(db_cfg)
                 resolution = _resolve_plan(req, sid, llm, engine, db_cfg.get("default_schema"), user)
                 plan = resolution.get("plan")
@@ -663,16 +697,12 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 # ── 提取图表/SQL，发送最终结果 ────────────────────────────
                 result_messages = list(input_messages) + list(all_new)
                 runtime.finalize()
-                visuals, tables, sql = _extract(all_new)
-                if runtime.validation_status != "approved":
-                    visuals, tables = [], []
-
                 reply = ""
                 for m in reversed(result_messages):
                     if isinstance(m, AIMessage) and m.content:
                         reply = m.content
                         break
-                reply = _guard_reply(reply, plan, runtime.validation_status)
+                reply, visuals, tables, sql = _display_result(all_new, reply, runtime, trace.snapshot())
                 persist_guarded_response(sid, user["uid"], user_msg.id, reply,
                                          visuals=visuals, tables=tables, sql=sql)
                 if reply:
@@ -804,10 +834,17 @@ def api_rename_session(session_id: str, req: RenameRequest, user: dict = Depends
     return {"ok": True, "session_id": session_id, "title": title}
 
 
+def _require_db_secret(cfg_id: int, user: dict) -> dict:
+    config = get_db_secret(cfg_id, user=user)
+    if config is None:
+        raise HTTPException(404, "DB config not found")
+    return config
+
+
 @router.get("/api/schema")
-def get_schema(db_config_id: int, schema: Optional[str] = None):
+def get_schema(db_config_id: int, schema: Optional[str] = None, user: dict = Depends(get_current_user)):
+    db_cfg = _require_db_secret(db_config_id, user)
     try:
-        db_cfg = get_db_secret(db_config_id)
         engine = build_engine(db_cfg)
         return {"tables": list_tables(engine, schema or db_cfg.get("default_schema"))}
     except Exception as e:

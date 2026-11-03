@@ -1,0 +1,54 @@
+name: Agent quality (real model)
+
+# Explicitly dispatch after reviewing changes to the planner, prompts, tools,
+# model configuration, or task suite. The protected environment owns credentials.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-quality-live
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    environment: agent-quality
+    timeout-minutes: 65
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - run: pip install -r requirements-dev.txt
+      - name: Run versioned synthetic suite and enforce release gate
+        env:
+          DATAPILOT_EVAL_MODEL_CONFIG: ${{ secrets.DATAPILOT_EVAL_MODEL_CONFIG }}
+        run: |
+          if [ -z "$DATAPILOT_EVAL_MODEL_CONFIG" ]; then
+            echo 'Missing approved model configuration in agent-quality environment' >&2
+            exit 1
+          fi
+          python -m app.evaluation.quality_runner run --split all --repeat 2 \
+            --timeout 100 --request-timeout 20 --max-calls 12 \
+            --policy all_required --out data/eval/ci-live.json
+      - name: Publish aggregate synthetic-run status to job summary
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+          report = Path('data/eval/ci-live.json')
+          if report.exists():
+              data = json.loads(report.read_text())
+              print('```json')
+              print(json.dumps({k: data[k] for k in ('suite_id', 'expected_runs', 'gate') if k in data}, indent=2))
+              print('```')
+          else:
+              print('No evaluation report was produced.')
+          PY

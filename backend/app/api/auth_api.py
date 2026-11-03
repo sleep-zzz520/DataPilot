@@ -21,13 +21,16 @@ def _require_admin(user: dict) -> None:
 
 
 def get_current_user(authorization: str = Header(default="")) -> dict:
-    """FastAPI 依赖：解析 Bearer token，失败抛 401。返回 {"uid","username"}。"""
+    """FastAPI 依赖：解析 Bearer token，失败抛 401。返回当前账号及角色。"""
     if not authorization.startswith("Bearer "):
         raise HTTPException(401, "未登录")
     payload = decode_token(authorization[7:])
     if not payload:
         raise HTTPException(401, "登录已过期，请重新登录")
-    return payload
+    account = get_user_by_username(payload.get("username", ""))
+    if not account or account["id"] != payload.get("uid"):
+        raise HTTPException(401, "账号不存在，请重新登录")
+    return {**payload, "role": account["role"]}
 
 
 class AuthReq(BaseModel):

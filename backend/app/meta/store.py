@@ -59,10 +59,11 @@ def _llm_view(o: dict) -> dict:
     v["api_key_masked"] = crypto.mask(plain)
     return v
 
-def _db_view(o: dict) -> dict:
+def _db_view(o: dict, *, include_password_mask: bool = True) -> dict:
     v = {k: o[k] for k in ("id", "name", "db_type", "host", "port", "username", "charset", "default_schema", "is_default") if k in o}
-    plain = crypto.decrypt(o["password_enc"]) if o.get("password_enc") else ""
-    v["password_masked"] = crypto.mask(plain)
+    if include_password_mask:
+        plain = crypto.decrypt(o["password_enc"]) if o.get("password_enc") else ""
+        v["password_masked"] = crypto.mask(plain)
     return v
 
 # ========== LLM Config ==========
@@ -116,23 +117,37 @@ def delete_llm_config(cfg_id: int) -> bool:
         return True
 
 # ========== DB Config ==========
-def list_db_configs() -> list[dict]:
+def _can_access_db(config: dict, user: Optional[dict]) -> bool:
+    return (
+        user is None  # Trusted internal configuration operations.
+        or user.get("role") == "admin"
+        or user["uid"] in config.get("allowed_user_ids", [])
+    )
+
+
+def list_db_configs(*, user: Optional[dict] = None) -> list[dict]:
     with _lock:
         items = _load_and_migrate(_DB_FILE, _migrate_db)
-        return [_db_view(it) for it in items]
+        return [
+            _db_view(it, include_password_mask=user is None or user.get("role") == "admin")
+            for it in items if _can_access_db(it, user)
+        ]
 
-def get_db_config(cfg_id: int) -> Optional[dict]:
+def get_db_config(cfg_id: int, *, user: Optional[dict] = None) -> Optional[dict]:
     with _lock:
         items = _load_and_migrate(_DB_FILE, _migrate_db)
         it = next((x for x in items if x.get("id") == cfg_id), None)
-        return _db_view(it) if it else None
+        if not it or not _can_access_db(it, user):
+            return None
+        return _db_view(it, include_password_mask=user is None or user.get("role") == "admin")
 
-def get_db_secret(cfg_id: int) -> Optional[dict]:
+def get_db_secret(cfg_id: int, *, user: Optional[dict] = None) -> Optional[dict]:
     """返回含真实 password 的完整配置（仅内部使用）"""
     with _lock:
         items = _load_and_migrate(_DB_FILE, _migrate_db)
         it = next((x for x in items if x.get("id") == cfg_id), None)
-        if not it: return None
+        if not it or not _can_access_db(it, user):
+            return None
         result = deepcopy(it)
         if "password_enc" in result:
             result["password"] = crypto.decrypt(result.pop("password_enc"))
@@ -147,6 +162,7 @@ def save_db_config(cfg: dict) -> dict:
         if "password" in cfg:
             cfg["password_enc"] = crypto.encrypt(cfg.pop("password"))
         if idx is not None:
+            cfg["allowed_user_ids"] = items[idx].get("allowed_user_ids", [])
             items[idx] = cfg
         else:
             cfg["id"] = _next_id(items)
@@ -161,3 +177,21 @@ def delete_db_config(cfg_id: int) -> bool:
         if len(new_items) == len(items): return False
         _save(_DB_FILE, new_items)
         return True
+
+
+def get_db_grants(cfg_id: int) -> Optional[list[int]]:
+    with _lock:
+        config = next((item for item in _load(_DB_FILE) if item.get("id") == cfg_id), None)
+        return config.get("allowed_user_ids", []) if config else None
+
+
+def replace_db_grants(cfg_id: int, user_ids: list[int]) -> Optional[list[int]]:
+    with _lock:
+        items = _load_and_migrate(_DB_FILE, _migrate_db)
+        config = next((item for item in items if item.get("id") == cfg_id), None)
+        if config is None:
+            return None
+        granted_ids = sorted(set(user_ids))
+        config["allowed_user_ids"] = granted_ids
+        _save(_DB_FILE, items)
+        return granted_ids

@@ -108,3 +108,12 @@ def test_mysql_engine_options_bound_connection_and_pool_waits():
         "read_timeout": DB_READ_TIMEOUT_SECONDS,
         "write_timeout": DB_WRITE_TIMEOUT_SECONDS,
     }
+
+
+def test_evaluation_timeout_reaches_the_client_without_mutating_cached_model():
+    cfg = {'id': 12344, 'provider': 'openai', 'model_name': 'gpt-4o', 'api_key': 'test'}
+    product = build_llm(cfg)
+    evaluation = build_llm(cfg, request_timeout=3.5)
+    assert evaluation.root_client.timeout == 3.5
+    assert product.root_client.timeout == LLM_REQUEST_TIMEOUT_SECONDS
+    assert build_llm(cfg) is product

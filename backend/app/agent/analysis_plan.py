@@ -112,6 +112,7 @@ class AnalysisPlan(BaseModel):
     sort: Optional[str] = None
     unit: Optional[str] = None
     steps: List[PlanStep] = Field(default_factory=list)
+    result_columns: List[str] = Field(default_factory=list)
     output_format: Literal["text", "table", "chart", "report"] = "text"
     assumptions: List[str] = Field(default_factory=list)
     clarification_needed: bool = False
@@ -141,6 +142,39 @@ class AnalysisPlan(BaseModel):
         if value is None:
             return None
         return _as_text(value) or None
+
+    @field_validator("sort", "time_range", mode="after")
+    @classmethod
+    def _normalize_unconstrained_fields(cls, value: Optional[str], info) -> Optional[str]:
+        if value is None or not value.strip():
+            return None
+        text = value.strip().casefold()
+        if text in {"无", "none"}:
+            return None
+        if info.field_name == "sort" and text in {"不排序", "无需排序"}:
+            return None
+        if info.field_name == "time_range" and text in {"全部数据", "全时段", "不限时间"}:
+            return None
+        try:
+            structured = json.loads(value)
+        except ValueError:
+            return value
+        if structured in (None, [], {}):
+            return None
+        if (info.field_name == "time_range" and isinstance(structured, dict)
+                and structured.get("type") in (None, "all")
+                and structured.keys() <= {"type", "start", "end", "description"}
+                and structured.get("description") in (None, "", "未指定时间范围，统计全部数据")
+                and structured.get("start") is None and structured.get("end") is None):
+            return None
+        return value
+
+    @field_validator("result_columns", mode="before")
+    @classmethod
+    def _coerce_result_columns(cls, value: Any) -> List[str]:
+        if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+            return []
+        return list(dict.fromkeys(item.strip() for item in value))
 
     @field_validator("output_format", mode="before")
     @classmethod
@@ -173,10 +207,11 @@ class AnalysisState(TypedDict):
 _PLAN_PROMPT = """你是企业数据分析规划器。请只输出 JSON，不要 Markdown。
 根据用户问题和候选数据表，生成一个可执行分析计划。
 JSON 字段必须是：goal, data_sources, metrics, dimensions, filters, time_range,
-grain, sort, unit, steps, output_format, assumptions, clarification_needed,
+grain, sort, unit, steps, output_format, result_columns, assumptions, clarification_needed,
 clarification_question。
 steps 中每项必须包含 id、title、kind、depends_on；kind 只能是
 discover_source/load_schema/query/calculate/validate/visualize/summarize。
+result_columns 只记录用户明确要求输出的列名（按原顺序），未指定时用 []。这些列是最终结果列，不是源字段；派生指标须在查询或计算步骤中产出。
 不确定指标口径时不要猜，设置 clarification_needed=true，并提出简短问题。
 候选表只是参考，不能编造不存在的表。
 
@@ -270,7 +305,11 @@ def make_analysis_plan_graph(llm):
 
 def plan_context(plan: AnalysisPlan) -> str:
     """给执行 Agent 的紧凑计划上下文，避免重复注入大对象。"""
-    return "【本轮分析计划】\n" + json.dumps(plan.model_dump(exclude_none=True), ensure_ascii=False)
+    text = "【本轮分析计划】\n" + json.dumps(plan.model_dump(exclude_none=True), ensure_ascii=False)
+    if plan.result_columns:
+        text += ("\n【最终结果表】按 result_columns 产出真实工具结果。派生指标请在 SQL 中计算并使用指定别名，"
+                 "不要只在回复中计算。分子、分母等可随指标一起查询用于校验。")
+    return text
 
 
 # 派生维度关键词：这些概念可由多列聚合得到（"科目"对应多个科目列），不做列名硬校验。
@@ -796,6 +835,46 @@ class PlanRuntime:
         self._current = None
         self._emit()
         return issues
+
+    def result_delivery(self) -> tuple[Optional[dict], Optional[str]]:
+        """Select a single verified result; independent query pages cannot prove coverage."""
+        requested = self.plan.result_columns
+        # Read explicit output counts from the user input, not the planner or summary.
+        count = re.search(r"(?:全部|所有|完整|前|返回|列出)\s*([0-9]{1,9})\s*(?:行|条记录)", self.question)
+        expected = int(count.group(1)) if count else 0
+        if not requested and not expected and not re.search(r"(?:全部|所有|完整)\s*(?:行|记录|数据|明细)", self.question):
+            return None, None
+        candidates = []
+        largest = 0
+        for evidence in reversed(self.plan.evidence):
+            if not evidence.get("active"):
+                continue
+            payload = self._payloads.get(evidence.get("id"))
+            if not payload:
+                continue
+            columns, rows = payload.get("columns", []), payload.get("rows", [])
+            if (not rows or not all(columns.count(column) == 1 for column in requested)
+                    or any(len(row) != len(columns) for row in rows)):
+                continue
+            largest = max(largest, len(rows))
+            total = payload.get("row_count_total", len(rows))
+            if evidence.get("truncated") and type(total) is int:
+                expected = max(expected, total)
+            if not evidence.get("truncated") and total == len(rows):
+                projection = requested or columns
+                indices = [columns.index(column) for column in requested] if requested else range(len(columns))
+                table = {**payload, "columns": projection, "rows": [[row[i] for i in indices] for row in rows]}
+                candidates.append((columns == projection, table))
+        if self.validation_status == "approved":
+            eligible = [(exact, table) for exact, table in candidates if not expected or len(table["rows"]) == expected]
+            if eligible:
+                return max(eligible, key=lambda candidate: candidate[0])[1], None
+        if expected and not any(len(table["rows"]) == expected for _, table in candidates):
+            return None, (
+                f"本轮未能验证完整交付：需要 {expected} 行，单次查询最多取得 {largest} 行，"
+                "本轮展示 0 行。"
+            )
+        return None, None
 
     def validate_evidence(self, final: bool = False) -> Dict[str, Any]:
         """Validate query evidence; final also requires planned computations/plots.

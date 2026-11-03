@@ -138,7 +138,7 @@ def _make_role_tool(
             if plan_runtime is not None:
                 plan_runtime.record_worker_failure(name, "busy")
             return _busy_message(name)
-        if plan_runtime is not None and plan_runtime.has_contracts:
+        if plan_runtime is not None and (plan_runtime.has_contracts or plan_runtime.plan.result_columns):
             system_prompt_for_run = system_prompt + "\n" + plan_context(plan_runtime.plan)
         else:
             system_prompt_for_run = system_prompt

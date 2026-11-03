@@ -63,3 +63,11 @@ def test_resolve_plan_pauses_then_resumes_saved_plan(isolated_storage, monkeypat
     )
     assert resumed["kind"] == "ready"
     assert resumed["plan"].goal == plan.goal
+
+
+def test_readonly_policy_allows_analysis_of_deleted_records_and_scoped_access():
+    from app.agent.hitl import request_refusal
+    assert request_refusal("请清空roster.csv中的所有员工")[0] == "readonly_write"
+    assert request_refusal("统计 roster.csv 中已删除的员工记录") is None
+    assert request_refusal("访问已授权的本租户数据库") is None
+    assert request_refusal("统计其他租户数据库的访问审批记录") is None

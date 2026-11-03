@@ -68,6 +68,8 @@ def test_expired_entries_are_cleaned_up():
 def test_stream_duplicate_returns_error(client, monkeypatch):
     from app.api import chat_api as chat_mod
     called = {"n": 0}
+    # ACL is exercised with two real fixture databases in test_db_access.py.
+    monkeypatch.setattr(chat_mod, "_require_db_secret", lambda cfg_id, user: {})
     monkeypatch.setattr(chat_mod, "build_llm", lambda *a, **k: called.update(n=called["n"] + 1) or object())
     token = _register(client, "alice")
     h = {"Authorization": f"Bearer {token}"}

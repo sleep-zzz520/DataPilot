@@ -14,6 +14,26 @@ _EXPORT = re.compile(r"导出|下载|export|download|csv|xlsx|excel|pdf|报表",
 _WIDE_QUERY = re.compile(r"全量|全部|所有|明细|历史|长期|跨年|大表|不限制|从开始|至今|最近三年|最近5年", re.I)
 
 
+# ponytail: deliberately limited to direct commands and explicit bypass language.
+# Data access authorization remains the responsibility of the storage boundary.
+_DIRECT_WRITE = re.compile(
+    r"^(?:请(?:帮我)?|帮我)?\s*(?:删除|清空|截断|更新|修改|插入|覆盖)\s*"
+    r"(?=[^。！？\n]*(?:\.(?:csv|xlsx?)(?![A-Za-z0-9_])|数据表|数据库|表中的|表里的))",
+    re.I,
+)
+_CROSS_TENANT = re.compile(r"(?:连接|访问|查询|读取|查看).{0,20}(?:其他|别的|另一)租户")
+_BYPASS_AUTH = re.compile(r"无需授权|不需要授权|绕过(?:权限|授权)|未获授权")
+
+
+def request_refusal(question: str) -> Optional[tuple[str, str]]:
+    question = question.strip()
+    if _DIRECT_WRITE.search(question):
+        return "readonly_write", "DataPilot 只读分析，无法删除或修改源数据。"
+    if _CROSS_TENANT.search(question) and _BYPASS_AUTH.search(question):
+        return "cross_tenant_bypass", "无法访问其他租户的未授权数据。请使用本租户已授权的数据源。"
+    return None
+
+
 def _text(value: Any) -> str:
     if value is None:
         return ""
