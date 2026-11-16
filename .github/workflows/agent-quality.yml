@@ -14,7 +14,8 @@ concurrency:
 
 jobs:
   acceptance:
-    runs-on: ubuntu-latest
+    # Keep the Python 3.9 runtime on a supported runner image, matching backend CI.
+    runs-on: ubuntu-24.04
     environment: agent-quality
     timeout-minutes: 65
     defaults:

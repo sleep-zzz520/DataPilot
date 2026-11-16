@@ -8,7 +8,8 @@ on:
 jobs:
   backend:
     name: 后端 单测 & 启动冒烟
-    runs-on: ubuntu-latest
+    # Python 3.9 has builds for 24.04; ubuntu-latest can move to an unsupported OS.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: backend
