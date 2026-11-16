@@ -11,17 +11,18 @@
           ><AppIcon name="back" :size="18"
         /></router-link>
       </div>
-      <div class="settings-category-search">
-        <AppIcon name="search" :size="16" /><input
-          v-model="categoryQuery"
-          placeholder="搜索设置"
-          aria-label="搜索设置分类"
-          @keydown.esc="categoryQuery = ''"
-        />
-      </div>
+      <button
+        type="button"
+        class="settings-category-search"
+        aria-haspopup="dialog"
+        aria-controls="settings-search"
+        @click="settingsSearchOpen = true"
+      >
+        <AppIcon name="search" :size="16" /><span>搜索设置</span>
+      </button>
       <nav role="tablist" aria-label="设置类别" aria-orientation="vertical">
         <button
-          v-for="(category, index) in visibleCategories"
+          v-for="(category, index) in categories"
           :key="category.id"
           :id="`settings-tab-${category.id}`"
           type="button"
@@ -30,7 +31,7 @@
           :aria-controls="`settings-panel-${category.id}`"
           :tabindex="
             selectedCategory === category.id ||
-            (!visibleCategories.some((c) => c.id === selectedCategory) &&
+            (!categories.some((c) => c.id === selectedCategory) &&
               index === 0)
               ? 0
               : -1
@@ -44,9 +45,6 @@
           }}</span>
         </button>
       </nav>
-      <p v-if="!visibleCategories.length" class="settings-search-empty">
-        没有匹配的设置
-      </p>
     </aside>
     <main class="settings-content" ref="contentEl">
       <div class="settings-content-inner">
@@ -137,15 +135,6 @@
             @remove="removeLlm"
             @rename="renameLlm"
           />
-          <div v-if="isAdmin && llmFormOpen" class="settings-editor">
-            <h3>{{ llmEditing ? "编辑模型" : "添加模型" }}</h3>
-            <LlmConfigForm
-              :key="llmEditing?.id || 'new-model'"
-              :initial-data="llmEditing"
-              @submit="onLlmSubmit"
-              @cancel="llmFormOpen = false"
-            />
-          </div>
         </section>
         <section
           v-show="selectedCategory === 'databases'"
@@ -180,23 +169,6 @@
             @remove="removeDb"
             @rename="renameDb"
           />
-          <div v-if="isAdmin && dbFormOpen" class="settings-editor">
-            <h3>
-              {{ dbEditing ? "编辑数据库" : "添加数据库" }}
-              <span
-                class="settings-help"
-                title="建议使用只读数据库账号"
-                aria-label="建议使用只读数据库账号"
-                >ⓘ</span
-              >
-            </h3>
-            <DbConfigForm
-              :key="dbEditing?.id || 'new-db'"
-              :initial-data="dbEditing"
-              @submit="onDbSubmit"
-              @cancel="dbFormOpen = false"
-            />
-          </div>
         </section>
         <section
           v-if="isAdmin"
@@ -237,6 +209,80 @@
         </section>
       </div>
     </main>
+    <dialog
+      v-if="isAdmin"
+      ref="llmDialog"
+      class="model-dialog"
+      aria-labelledby="model-dialog-title"
+      @cancel.prevent="closeLlmForm"
+      @click.self="closeLlmForm"
+    >
+      <div class="model-dialog-content">
+        <header class="model-dialog-heading">
+          <h2 id="model-dialog-title">{{ llmEditing ? "编辑模型" : "添加模型" }}</h2>
+          <button
+            type="button"
+            class="icon-button"
+            aria-label="关闭模型弹窗"
+            :disabled="llmSaving"
+            @click="closeLlmForm"
+          ><AppIcon name="close" :size="20" /></button>
+        </header>
+        <div class="model-dialog-body">
+          <LlmConfigForm
+            v-if="llmFormOpen"
+            :key="llmEditing?.id || 'new-model'"
+            :initial-data="llmEditing"
+            :saving="llmSaving"
+            @submit="onLlmSubmit"
+            @cancel="closeLlmForm"
+          />
+        </div>
+      </div>
+    </dialog>
+    <dialog
+      v-if="isAdmin"
+      ref="dbDialog"
+      class="model-dialog database-dialog"
+      aria-labelledby="database-dialog-title"
+      @cancel.prevent="closeDbForm"
+      @click.self="closeDbForm"
+    >
+      <div class="model-dialog-content">
+        <header class="model-dialog-heading">
+          <h2 id="database-dialog-title">
+            {{ dbEditing ? "编辑数据库" : "添加数据库" }}
+            <span class="settings-help" title="建议使用只读数据库账号" aria-label="建议使用只读数据库账号">ⓘ</span>
+          </h2>
+          <button
+            type="button"
+            class="icon-button"
+            aria-label="关闭数据库弹窗"
+            :disabled="dbSaving"
+            @click="closeDbForm"
+          ><AppIcon name="close" :size="20" /></button>
+        </header>
+        <div class="model-dialog-body">
+          <DbConfigForm
+            v-if="dbFormOpen"
+            :key="dbEditing?.id || 'new-db'"
+            :initial-data="dbEditing"
+            :saving="dbSaving"
+            @submit="onDbSubmit"
+            @cancel="closeDbForm"
+          />
+        </div>
+      </div>
+    </dialog>
+    <SearchDialog
+      id="settings-search"
+      v-model:open="settingsSearchOpen"
+      title="搜索设置"
+      placeholder="输入设置分类名称"
+      :items="categorySearchItems"
+      empty-text="没有匹配的设置"
+      @select="selectedCategory = $event"
+    />
   </div>
 </template>
 
@@ -249,42 +295,71 @@ import ConfigList from "../components/ConfigList.vue";
 import LlmConfigForm from "../components/LlmConfigForm.vue";
 import DbConfigForm from "../components/DbConfigForm.vue";
 import AppIcon from "../components/AppIcon.vue";
+import SearchDialog from "../components/SearchDialog.vue";
 
 const accountActions = inject("accountActions", () => {});
 const store = useConfigStore();
 const llmEditing = ref(null);
 const dbEditing = ref(null);
-// 配置全局共享，仅管理员可修改
-const isAdmin = localStorage.getItem("role") === "admin";
-const myName = localStorage.getItem("username") || "";
+// 配置全局共享；以服务端当前角色为准，避免升降级后仍使用登录时的缓存。
+const currentUser = ref(null);
+const isAdmin = computed(() => currentUser.value?.role === "admin");
+const myName = computed(
+  () => currentUser.value?.username || localStorage.getItem("username") || "",
+);
 
 // 用户管理（仅管理员）
 const users = ref([]);
 
 const selectedCategory = ref("account");
-const categoryQuery = ref("");
+const settingsSearchOpen = ref(false);
 const contentEl = ref(null);
 const llmFormOpen = ref(false),
   dbFormOpen = ref(false);
+const llmDialog = ref(null);
+const llmSaving = ref(false);
+const dbDialog = ref(null);
+const dbSaving = ref(false);
 const settingsError = ref("");
 const categories = computed(() => [
   { id: "account", name: "账户", icon: "user" },
   { id: "models", name: "模型", icon: "brand" },
   { id: "databases", name: "数据库", icon: "database" },
-  ...(isAdmin ? [{ id: "users", name: "用户管理", icon: "users" }] : []),
+  ...(isAdmin.value ? [{ id: "users", name: "用户管理", icon: "users" }] : []),
 ]);
 const currentCategory = computed(
   () =>
     categories.value.find((c) => c.id === selectedCategory.value) ||
     categories.value[0],
 );
-const visibleCategories = computed(() =>
-  categories.value.filter((c) => c.name.includes(categoryQuery.value.trim())),
+const categorySearchItems = computed(() =>
+  categories.value.map((category) => ({
+    id: category.id,
+    title: category.name,
+    icon: category.icon,
+    active: category.id === selectedCategory.value,
+  })),
 );
 watch(selectedCategory, async () => {
+  if (selectedCategory.value !== "models") closeLlmForm();
+  if (selectedCategory.value !== "databases") closeDbForm();
   await nextTick();
   if (contentEl.value) contentEl.value.scrollTop = 0;
 });
+watch([llmFormOpen, dbFormOpen, isAdmin], async ([llmOpen, dbOpen, admin]) => {
+  await nextTick();
+  for (const [dialog, open] of [[llmDialog.value, llmOpen], [dbDialog.value, dbOpen]]) {
+    if (!dialog) continue;
+    if (open && admin && !dialog.open) dialog.showModal();
+    else if ((!open || !admin) && dialog.open) dialog.close();
+  }
+});
+function closeLlmForm() {
+  if (!llmSaving.value) llmFormOpen.value = false;
+}
+function closeDbForm() {
+  if (!dbSaving.value) dbFormOpen.value = false;
+}
 function onCategoryKey(event, index) {
   const keys = [
     "ArrowDown",
@@ -294,9 +369,9 @@ function onCategoryKey(event, index) {
     "Home",
     "End",
   ];
-  if (!keys.includes(event.key) || !visibleCategories.value.length) return;
+  if (!keys.includes(event.key) || !categories.value.length) return;
   event.preventDefault();
-  const last = visibleCategories.value.length - 1;
+  const last = categories.value.length - 1;
   const target =
     event.key === "Home"
       ? 0
@@ -308,12 +383,20 @@ function onCategoryKey(event, index) {
             1) %
           (last + 1);
   const tablist = event.currentTarget.parentElement;
-  selectedCategory.value = visibleCategories.value[target].id;
+  selectedCategory.value = categories.value[target].id;
   nextTick(() => tablist.querySelectorAll('[role="tab"]')[target]?.focus());
 }
 async function loadSettings() {
   settingsError.value = "";
+  currentUser.value = null;
   try {
+    const account = await authApi.me();
+    currentUser.value = account;
+    localStorage.setItem("role", account.role);
+    localStorage.setItem("username", account.username);
+    if (!isAdmin.value && selectedCategory.value === "users") {
+      selectedCategory.value = "account";
+    }
     await store.loadAll();
     await loadUsers();
   } catch (err) {
@@ -323,7 +406,7 @@ async function loadSettings() {
 onMounted(loadSettings);
 
 async function loadUsers() {
-  if (!isAdmin) return;
+  if (!isAdmin.value) return;
   try {
     users.value = await authApi.listUsers();
   } catch (_) {
@@ -342,10 +425,13 @@ async function setRole(u, role) {
 
 // 保存后：用返回的 view 更新编辑态（新建→变成编辑态，避免重复新建），并刷新列表
 async function onLlmSubmit(form) {
+  if (llmSaving.value) return;
+  llmSaving.value = true;
   try {
     // 合并编辑态保留字段：默认标记（表单没有该字段，编辑默认项时不能丢）
     const payload = {
       ...form,
+      ...(llmEditing.value?.id ? { id: llmEditing.value.id } : {}),
       is_default: llmEditing.value?.is_default || false,
     };
     const view = await api.saveLlm(payload);
@@ -361,20 +447,27 @@ async function onLlmSubmit(form) {
           (err.suggestion || err.message || JSON.stringify(err)),
       );
     }
+    llmFormOpen.value = false;
   } catch (err) {
     alert(
       "保存失败：" + (err.suggestion || err.message || JSON.stringify(err)),
     );
+  } finally {
+    llmSaving.value = false;
   }
 }
 
 async function onDbSubmit(form) {
+  if (dbSaving.value) return;
+  dbSaving.value = true;
   try {
-    // 合并编辑态保留字段：charset / default_schema（表单没有这些字段）
+    // 表单的数据库名映射到 default_schema，并保留编辑项的标识和默认标记。
     const payload = {
       ...form,
+      ...(dbEditing.value?.id ? { id: dbEditing.value.id } : {}),
       charset: dbEditing.value?.charset || "utf8mb4",
-      default_schema: dbEditing.value?.default_schema ?? null,
+      default_schema: form.database?.trim() || dbEditing.value?.default_schema || null,
+      is_default: dbEditing.value?.is_default || false,
     };
     const view = await api.saveDb(payload);
     dbEditing.value = view;
@@ -388,10 +481,13 @@ async function onDbSubmit(form) {
           (err.suggestion || err.message || JSON.stringify(err)),
       );
     }
+    dbFormOpen.value = false;
   } catch (err) {
     alert(
       "保存失败：" + (err.suggestion || err.message || JSON.stringify(err)),
     );
+  } finally {
+    dbSaving.value = false;
   }
 }
 
@@ -473,17 +569,14 @@ async function renameDb(it, name) {
   padding: 9px 11px;
   margin: 0 4px 24px;
   color: var(--text-tertiary);
-}
-.settings-category-search input {
-  width: 100%;
-  min-width: 0;
+  width: calc(100% - 8px);
   border: 0;
-  background: none;
-  color: var(--text-primary);
+  font: inherit;
   font-size: 12px;
-  outline: none;
+  text-align: left;
+  cursor: pointer;
 }
-.settings-category-search:focus-within {
+.settings-category-search:focus-visible {
   outline: 2px solid #9c4e3555;
   outline-offset: 2px;
 }
@@ -514,11 +607,6 @@ async function renameDb(it, name) {
 }
 .settings-navigation nav button:hover {
   color: var(--text-primary);
-}
-.settings-search-empty {
-  padding: 0 12px;
-  font-size: 12px;
-  color: var(--text-tertiary);
 }
 .settings-content {
   min-width: 0;
@@ -564,10 +652,65 @@ async function renameDb(it, name) {
 .account-setting-row + .account-setting-row {
   border-top: 0;
 }
-.settings-editor {
-  margin-top: 35px;
-  padding-top: 27px;
-  border-top: 1px solid var(--border-color);
+.model-dialog {
+  width: min(540px, calc(100vw - 32px));
+  max-height: calc(100dvh - 40px);
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--border-color);
+  border-radius: 20px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  box-shadow: 0 20px 70px #201e1926;
+  overflow: hidden;
+}
+.model-dialog[open] {
+  animation: settings-enter 0.18s ease;
+}
+.model-dialog::backdrop {
+  background: #201e1966;
+  animation: model-backdrop-enter 0.18s ease;
+}
+.model-dialog-content {
+  display: flex;
+  flex-direction: column;
+  max-height: inherit;
+}
+.model-dialog-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  gap: 16px;
+  padding: 24px 28px 18px;
+}
+.model-dialog-heading h2 {
+  font-size: 21px;
+  font-weight: 550;
+  letter-spacing: -0.4px;
+}
+.model-dialog-body {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 28px 26px;
+}
+.model-dialog-body :deep(.llm-config-form),
+.model-dialog-body :deep(.db-config-form) {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.model-dialog-body :deep(.submit) {
+  box-shadow: none;
+}
+.model-dialog-body :deep(.submit:hover:not(:disabled)) {
+  box-shadow: none;
+}
+@keyframes model-backdrop-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 .settings-help {
   color: var(--text-tertiary);
@@ -670,6 +813,7 @@ async function renameDb(it, name) {
     padding: 24px 10px;
   }
   .settings-category-search {
+    width: 100%;
     padding: 8px;
     margin-left: 0;
     margin-right: 0;
@@ -691,6 +835,16 @@ async function renameDb(it, name) {
   }
 }
 @media (max-width: 540px) {
+  .model-dialog {
+    max-height: calc(100dvh - 24px);
+    border-radius: 16px;
+  }
+  .model-dialog-heading {
+    padding: 20px 20px 16px;
+  }
+  .model-dialog-body {
+    padding: 0 20px 20px;
+  }
   .settings-layout {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto minmax(0, 1fr);
@@ -709,7 +863,7 @@ async function renameDb(it, name) {
     font-size: 19px;
   }
   .settings-category-search {
-    display: none;
+    margin-bottom: 12px;
   }
   .settings-navigation nav {
     flex-direction: row;
@@ -737,7 +891,9 @@ async function renameDb(it, name) {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .settings-panel {
+  .settings-panel,
+  .model-dialog[open],
+  .model-dialog::backdrop {
     animation: none;
   }
 }

@@ -21,23 +21,13 @@
       <button
         class="sidebar-action search-conversations"
         :aria-expanded="searchOpen"
+        aria-haspopup="dialog"
         aria-label="搜索会话"
-        @click="toggleSearch"
+        @click="searchOpen = true"
       >
         <AppIcon name="search" :size="18" /><span>搜索会话</span>
       </button>
     </div>
-    <Transition name="search">
-      <input
-        v-if="searchOpen"
-        ref="searchEl"
-        v-model="query"
-        class="session-search"
-        placeholder="搜索会话"
-        aria-label="搜索会话标题"
-        @keydown.esc="closeSearch"
-      />
-    </Transition>
     <div class="sidebar-scroll">
       <div class="sidebar-section-title recent-section">
         <button
@@ -58,7 +48,7 @@
       <Transition name="sidebar-tree">
         <div v-if="recentOpen" id="sidebar-recent-list">
           <button
-            v-for="session in visibleSessions"
+            v-for="session in sessions"
             :key="session.id"
             class="session-link ungrouped-session"
             :class="{ active: session.id === sessionId }"
@@ -68,9 +58,7 @@
           >
             <span>{{ session.title || "新会话" }}</span>
           </button>
-          <div v-if="!visibleSessions.length && !busy" class="sidebar-empty">
-            {{ query.trim() ? "没有匹配的会话" : "暂无会话" }}
-          </div>
+          <div v-if="!sessions.length && !busy" class="sidebar-empty">暂无会话</div>
         </div>
       </Transition>
     </div>
@@ -93,11 +81,22 @@
         </div>
       </details>
     </div>
+    <SearchDialog
+      id="session-search"
+      v-model:open="searchOpen"
+      title="搜索会话"
+      placeholder="输入会话标题"
+      :items="searchItems"
+      :busy="busy"
+      empty-text="暂无会话"
+      @select="$emit('select-session', $event)"
+    />
   </aside>
 </template>
 <script setup>
-import { computed, nextTick, ref } from "vue";
+import { computed, ref } from "vue";
 import AppIcon from "./AppIcon.vue";
+import SearchDialog from "./SearchDialog.vue";
 const props = defineProps({
   sessions: { type: Array, default: () => [] },
   sessionId: String,
@@ -110,30 +109,11 @@ const props = defineProps({
   role: { type: String, default: () => localStorage.getItem("role") || "user" },
 });
 defineEmits(["toggle", "new-chat", "select-session", "account"]);
-const searchOpen = ref(false),
-  query = ref(""),
-  recentOpen = ref(true),
-  searchEl = ref(null);
-const visibleSessions = computed(() => {
-  const term = query.value.trim().toLocaleLowerCase();
-  return props.sessions.filter((session) =>
-    String(session.title || "新会话")
-      .toLocaleLowerCase()
-      .includes(term),
-  );
-});
-function closeSearch() {
-  query.value = "";
-  searchOpen.value = false;
-}
-async function toggleSearch() {
-  if (searchOpen.value) {
-    closeSearch();
-    return;
-  }
-  searchOpen.value = true;
-  recentOpen.value = true;
-  await nextTick();
-  searchEl.value?.focus();
-}
+const searchOpen = ref(false);
+const recentOpen = ref(true);
+const searchItems = computed(() => props.sessions.map(session => ({
+  id: session.id,
+  title: session.title || "新会话",
+  active: session.id === props.sessionId,
+})));
 </script>

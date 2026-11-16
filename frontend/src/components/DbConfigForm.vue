@@ -1,9 +1,9 @@
 <template>
   <div class="db-config-form">
-    <form @submit.prevent="onSubmit">
+    <form :aria-busy="saving" @submit.prevent="onSubmit">
       <div class="field">
         <label>配置名称</label>
-        <input v-model="form.name" placeholder="例如：生产数据库" required />
+        <input v-model="form.name" placeholder="例如：生产数据库" autofocus required />
       </div>
       <div class="field">
         <label>主机</label>
@@ -37,9 +37,9 @@
         </div>
       </div>
       <div class="actions">
-        <button type="button" class="cancel" @click="$emit('cancel')">取消</button>
-        <button type="submit" class="submit" :disabled="loading">
-          {{ loading ? '测试中...' : '保存并测试' }}
+        <button type="button" class="cancel" :disabled="saving" @click="$emit('cancel')">取消</button>
+        <button type="submit" class="submit" :disabled="saving">
+          {{ saving ? '保存并测试中...' : '保存并测试' }}
         </button>
       </div>
     </form>
@@ -47,14 +47,14 @@
 </template>
 
 <script setup>
-import { reactive, ref, watch } from 'vue'
+import { reactive, watch } from 'vue'
 
 const props = defineProps({
-  initialData: { type: Object, default: () => ({}) }
+  initialData: { type: Object, default: () => ({}) },
+  saving: { type: Boolean, default: false }
 })
 
 const emit = defineEmits(['submit', 'cancel'])
-const loading = ref(false)
 
 const initialData = props.initialData || {}
 const form = reactive({
@@ -62,7 +62,7 @@ const form = reactive({
   host: initialData.host || 'localhost',
   port: initialData.port || 3306,
   db_type: initialData.db_type || 'mysql',
-  database: initialData.database || '',
+  database: initialData.default_schema || initialData.database || '',
   username: initialData.username || 'root',
   password: initialData.password || ''
 })
@@ -74,18 +74,13 @@ watch(() => props.initialData, (v) => {
   form.host = p.host || 'localhost'
   form.port = p.port || 3306
   form.db_type = p.db_type || 'mysql'
-  form.database = p.database || ''
+  form.database = p.default_schema || p.database || ''
   form.username = p.username || 'root'
   form.password = p.password || ''
 }, { deep: true })
 
-const onSubmit = async () => {
-  loading.value = true
-  try {
-    emit('submit', { ...form })
-  } finally {
-    loading.value = false
-  }
+const onSubmit = () => {
+  if (!props.saving) emit('submit', { ...form })
 }
 </script>
 

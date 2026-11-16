@@ -1,9 +1,9 @@
 <template>
   <div class="llm-config-form">
-    <form @submit.prevent="onSubmit">
+    <form :aria-busy="saving" @submit.prevent="onSubmit">
       <div class="field">
         <label>配置名称</label>
-        <input v-model="form.name" placeholder="例如：GPT-4" required />
+        <input v-model="form.name" placeholder="例如：GPT-4" autofocus required />
       </div>
       <div class="field">
         <label>API 提供商</label>
@@ -37,9 +37,9 @@
         </div>
       </div>
       <div class="actions">
-        <button type="button" class="cancel" @click="$emit('cancel')">取消</button>
-        <button type="submit" class="submit" :disabled="loading">
-          {{ loading ? '测试中...' : '保存并测试' }}
+        <button type="button" class="cancel" :disabled="saving" @click="$emit('cancel')">取消</button>
+        <button type="submit" class="submit" :disabled="saving">
+          {{ saving ? '保存并测试中...' : '保存并测试' }}
         </button>
       </div>
     </form>
@@ -47,14 +47,14 @@
 </template>
 
 <script setup>
-import { reactive, ref, watch } from 'vue'
+import { reactive, watch } from 'vue'
 
 const props = defineProps({
-  initialData: { type: Object, default: () => ({}) }
+  initialData: { type: Object, default: () => ({}) },
+  saving: { type: Boolean, default: false }
 })
 
 const emit = defineEmits(['submit', 'cancel'])
-const loading = ref(false)
 
 // 各提供商默认接口地址（与后端 factories.PROVIDER_DEFAULT_BASE_URL 保持一致）
 const PROVIDER_URLS = {
@@ -99,13 +99,8 @@ watch(() => props.initialData, (v) => {
   form.max_tokens = p.max_tokens || 4096
 }, { deep: true })
 
-const onSubmit = async () => {
-  loading.value = true
-  try {
-    emit('submit', { ...form })
-  } finally {
-    loading.value = false
-  }
+const onSubmit = () => {
+  if (!props.saving) emit('submit', { ...form })
 }
 </script>
 

@@ -217,26 +217,6 @@ label svg {
 .section-toggle svg {
   transition: transform 0.18s ease;
 }
-.session-search {
-  margin: 0 6px 10px;
-  padding: 8px 10px;
-  min-width: 0;
-  border: 1px solid var(--border-color);
-  border-radius: 9px;
-  background: var(--bg-primary);
-  font-size: 12px;
-}
-.search-enter-active,
-.search-leave-active {
-  transition:
-    opacity 0.18s ease,
-    transform 0.18s ease;
-}
-.search-enter-from,
-.search-leave-to {
-  opacity: 0;
-  transform: translateY(-5px);
-}
 .sidebar-scroll {
   flex: 1;
   overflow-y: auto;
