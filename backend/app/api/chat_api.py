@@ -25,6 +25,7 @@ from app.memory.agent_memory import (
     save_analysis_record, delete_analysis_records,
 )
 from app.db.schema import list_tables
+from app.security.data_policy import load_data_policy
 from app.agent.analysis_plan import AnalysisPlan, make_analysis_plan_graph, PlanRuntime, plan_context
 from app.agent.contracts import MetricContractRegistry, ContractBinding, ValidationIssue, bind_metric_contracts
 from app.agent.contract_catalog import load_contract_catalog
@@ -177,7 +178,9 @@ def _build_plan(llm, engine, question: str, schema: Optional[str], file_ids: lis
     except Exception:
         catalog = []
     result = make_analysis_plan_graph(llm).invoke({
-        "question": question, "catalog": catalog, "plan": None, "error": None,
+        "question": (f"【当前选择的数据库】{schema}；以此为准，不沿用历史库名。\n{question}"
+                     if schema else question),
+        "catalog": catalog, "plan": None, "error": None,
         "memory_context": memory_context,
     })
     plan = result["plan"]
@@ -289,6 +292,7 @@ def _resolve_plan(req: ChatRequest, sid: str, llm, engine, schema: Optional[str]
         return {
             "kind": "ready",
             "plan": resumed,
+            "sensitive_approved": True,
             "binding": binding, "catalog": catalog,
             "plan_event": {"type": "plan", "event": "plan_resumed", "plan": plan_data},
         }
@@ -308,7 +312,8 @@ def _resolve_plan(req: ChatRequest, sid: str, llm, engine, schema: Optional[str]
     binding, catalog = _bind_request_contracts(req, plan, engine, user)
     plan_event["plan"] = plan.model_dump(exclude_none=True)
     file_metadata = [get_upload(str(fid), user["uid"]) or {} for fid in req.file_ids]
-    confirmation = assess_confirmation(req.message, plan, file_metadata)
+    confirmation = assess_confirmation(
+        req.message, plan, file_metadata, sensitive_tables=load_data_policy().sensitive_tables)
     if not confirmation.get("required"):
         return {"kind": "ready", "plan": plan, "plan_event": plan_event, "binding": binding, "catalog": catalog}
     if confirmation.get("mode") == "clarification":
@@ -468,7 +473,9 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             uploaded_file_paths = _uploaded_file_paths(req.file_ids, user["uid"])
             tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
                                audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid},
-                               file_paths=uploaded_file_paths)
+                               file_paths=uploaded_file_paths,
+                               allowed_schemas=([db_cfg["default_schema"]] if db_cfg.get("default_schema") else None),
+                               sensitive_approved=resolution.get("sensitive_approved", False))
             ctx = ""
             for fid in req.file_ids:
                 meta = get_upload(str(fid), user["uid"])
@@ -491,6 +498,8 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
             # ── 上下文压缩：token 预算制截断（替代纯轮数截断），
             # 历史 + 当前消息总估算 token 不超过预算，防止上下文无限膨胀 ──
             system_prompt = supervisor_prompt + "\n\n" + CONVERSATION_HINT + "\n\n" + plan_context(plan)
+            if db_cfg.get("default_schema"):
+                system_prompt += "\n【当前选择的数据库】" + db_cfg["default_schema"] + "；历史库名不能覆盖本次选择。"
             # ── 记忆注入：长期记忆（跨会话）+ 会话摘要 + 相关历史检索 ──────
             memory_ctx = build_memory_context(user["uid"], sid, req.message, scope=_memory_scope(req))
             input_messages = assemble_context(system_prompt, history, user_text, tools=tools,
@@ -622,7 +631,9 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 uploaded_file_paths = _uploaded_file_paths(req.file_ids, user["uid"])
                 tools = make_tools(engine, db_cfg.get("default_schema"), files=uploaded_files,
                                    audit_ctx={"user_id": user["uid"], "username": user.get("username"), "session_id": sid},
-                                   file_paths=uploaded_file_paths)
+                                   file_paths=uploaded_file_paths,
+                                   allowed_schemas=([db_cfg["default_schema"]] if db_cfg.get("default_schema") else None),
+                                   sensitive_approved=resolution.get("sensitive_approved", False))
                 ctx = ""
                 for fid in req.file_ids:
                     meta = get_upload(str(fid), user["uid"])
@@ -645,6 +656,8 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 history = get_history(sid)
                 # ── 上下文压缩：token 预算制截断（与同步接口一致）─────────
                 system_prompt = supervisor_prompt + "\n\n" + CONVERSATION_HINT + "\n\n" + plan_context(plan)
+                if db_cfg.get("default_schema"):
+                    system_prompt += "\n【当前选择的数据库】" + db_cfg["default_schema"] + "；历史库名不能覆盖本次选择。"
                 # ── 记忆注入：长期记忆 + 会话摘要 + 相关历史检索（与同步一致）─
                 memory_ctx = build_memory_context(user["uid"], sid, req.message, scope=_memory_scope(req))
                 input_messages = assemble_context(system_prompt, history, user_text, tools=tools,
@@ -844,6 +857,8 @@ def _require_db_secret(cfg_id: int, user: dict) -> dict:
 @router.get("/api/schema")
 def get_schema(db_config_id: int, schema: Optional[str] = None, user: dict = Depends(get_current_user)):
     db_cfg = _require_db_secret(db_config_id, user)
+    if schema and db_cfg.get("default_schema") and schema != db_cfg["default_schema"]:
+        raise HTTPException(403, "该库不在当前选择的数据源范围内")
     try:
         engine = build_engine(db_cfg)
         return {"tables": list_tables(engine, schema or db_cfg.get("default_schema"))}

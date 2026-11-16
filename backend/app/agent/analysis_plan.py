@@ -162,7 +162,7 @@ class AnalysisPlan(BaseModel):
         if structured in (None, [], {}):
             return None
         if (info.field_name == "time_range" and isinstance(structured, dict)
-                and structured.get("type") in (None, "all")
+                and structured.get("type") in (None, "all", "none")
                 and structured.keys() <= {"type", "start", "end", "description"}
                 and structured.get("description") in (None, "", "未指定时间范围，统计全部数据")
                 and structured.get("start") is None and structured.get("end") is None):
@@ -325,6 +325,23 @@ def _norm(text: Any) -> str:
     return re.sub(r"\s+", "", str(text or "")).lower()
 
 
+_AGGREGATE_RE = re.compile(r"\b(?:sum|count|avg|average|min|max|count_distinct)\s*\(", re.I)
+_AGGREGATIONS = {"sum", "count", "avg", "average", "min", "max", "count_distinct", "countdistinct"}
+
+
+def _has_aggregate_metric(metrics) -> bool:
+    """Raw-value metrics (e.g. daily kWh) do not require GROUP BY just because a grain exists."""
+    for metric in metrics or []:
+        if isinstance(metric, dict):
+            aggregation = str(metric.get("aggregation") or "").strip().lower()
+            expression = str(metric.get("expression") or "")
+            if aggregation in _AGGREGATIONS or _AGGREGATE_RE.search(expression):
+                return True
+        elif _AGGREGATE_RE.search(str(metric)):
+            return True
+    return False
+
+
 def check_dimensions_against_columns(dimensions, columns) -> list[str]:
     """校验计划要求的维度是否落在数据源真实列上。
 
@@ -417,8 +434,13 @@ class PlanRuntime:
         self.validation_report: dict[str, Any] = {}
         # Never trust bindings or executable evidence returned in planner JSON.
         self.plan.bound_contracts = []
-        for issue in check_dimensions_against_columns(plan.dimensions, self.columns):
-            self._add_issue("missing_dimension", issue, action="clarify")
+        metadata_only = (bool(plan.steps) and not plan.metrics and binding is None
+                         and all(step.kind in {"discover_source", "load_schema", "validate", "summarize"}
+                                 for step in plan.steps))
+        # Metadata labels (schema/table_name) are not columns in business tables.
+        if not metadata_only:
+            for issue in check_dimensions_against_columns(plan.dimensions, self.columns):
+                self._add_issue("missing_dimension", issue, action="clarify")
         for issue in _dependency_issues(plan):
             self._add_issue("invalid_dependencies", issue, action="clarify")
         if binding is not None:
@@ -795,7 +817,8 @@ class PlanRuntime:
                     issues.append("查询未体现计划中的过滤条件")
                 if self.plan.time_range and "where" not in sql.lower():
                     issues.append("查询未体现计划中的时间范围")
-                if self.plan.grain and self.plan.dimensions and "group by" not in sql.lower():
+                if (self.plan.grain and self.plan.dimensions and _has_aggregate_metric(self.plan.metrics)
+                        and "group by" not in sql.lower()):
                     issues.append("查询未体现计划要求的聚合粒度")
                 if self.plan.sort and "order by" not in sql.lower():
                     issues.append("查询未体现计划要求的排序")

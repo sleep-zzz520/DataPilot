@@ -12,6 +12,8 @@ from fastapi.responses import JSONResponse
 from app import persistence
 from app.core.metrics import metrics
 from app.core.logging import get_logger
+from app.db.query_cache import get_query_cache
+from app.db.query_runtime import query_runtime
 
 logger = get_logger("health")
 
@@ -60,4 +62,7 @@ def ready():
 
 @router.get("/api/metrics")
 def api_metrics():
-    return metrics.snapshot()
+    snapshot = metrics.snapshot()
+    snapshot["query_cache"] = get_query_cache().stats()
+    snapshot["query_runtime"] = query_runtime.snapshot()
+    return snapshot

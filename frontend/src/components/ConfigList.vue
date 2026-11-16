@@ -2,12 +2,12 @@
   <div class="list">
     <div class="head">
       <span class="title">{{ title }}</span>
-      <button v-if="!readonly" class="new" @click="$emit('create')">
+      <button v-if="!readonly && showCreate" class="new" @click="$emit('create')">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
         新建
       </button>
     </div>
-    <div v-if="!items.length" class="empty">暂无配置，点"新建"添加。</div>
+    <div v-if="!items.length" class="empty">{{ readonly ? '暂无可用配置。' : '暂无配置，点击添加开始配置。' }}</div>
     <ul v-else>
       <li v-for="it in items" :key="it.id" :class="{ active: it.id === currentId }">
         <div class="info" @click="!readonly && $emit('select', it)">
@@ -46,7 +46,7 @@
 </template>
 <script setup>
 import { ref, nextTick } from 'vue'
-defineProps({ items: Array, currentId: [Number, null], title: String, subtitle: { type: Function, default: () => '' }, readonly: Boolean })
+defineProps({ items: Array, currentId: [Number, null], title: String, subtitle: { type: Function, default: () => '' }, readonly: Boolean, showCreate: { type: Boolean, default: true } })
 const emit = defineEmits(['select','setDefault','remove','create','rename'])
 const onRemove = (it) => { if (confirm(`确定删除配置「${it.name}」？`)) emit('remove', it) }
 

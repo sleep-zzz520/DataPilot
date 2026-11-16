@@ -297,3 +297,34 @@ def test_requested_row_count_matches_verified_delivery(chat_harness, stream, pag
         assert "本轮展示 0 行" in result["reply"]
         assert persisted["text"] == result["reply"]
         assert any(m.content == "已完整展示全部记录。" for m in load_session(result["session_id"], 7))
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_selected_database_limits_tools_and_overrides_history(chat_harness, monkeypatch, stream):
+    chat_harness([AIMessage(content="当前选择零售库")])
+    monkeypatch.setattr(api, "_require_db_secret", lambda *args: {"default_schema": "share-retail"})
+    monkeypatch.setattr(api, "get_history", lambda *args: [AIMessage(content="之前使用 share-order")])
+    seen_tools, seen_prompts = [], []
+    monkeypatch.setattr(api, "make_tools", lambda *args, **kwargs: seen_tools.append(kwargs) or [])
+    original = api.assemble_context
+
+    def capture(system_prompt, *args, **kwargs):
+        seen_prompts.append(system_prompt)
+        return original(system_prompt, *args, **kwargs)
+
+    monkeypatch.setattr(api, "assemble_context", capture)
+    response, _ = asyncio.run(request(stream, message="当前可以查哪些表"))
+    assert not response.get("error")
+    assert seen_tools[0]["allowed_schemas"] == ["share-retail"]
+    assert seen_tools[0]["sensitive_approved"] is False
+    assert "【当前选择的数据库】share-retail" in seen_prompts[0]
+    assert "历史库名不能覆盖本次选择" in seen_prompts[0]
+
+
+def test_schema_endpoint_cannot_leave_selected_database(monkeypatch):
+    from fastapi import HTTPException
+    monkeypatch.setattr(api, "_require_db_secret", lambda *args: {"default_schema": "share-retail"})
+    monkeypatch.setattr(api, "build_engine", lambda *args: pytest.fail("unauthorized connection"))
+    with pytest.raises(HTTPException) as exc:
+        api.get_schema(1, "share-order", {"uid": 7})
+    assert exc.value.status_code == 403

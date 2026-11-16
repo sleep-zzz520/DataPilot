@@ -45,4 +45,22 @@ describe('AgentTrace', () => {
     await step.trigger('click')
     expect(w.find('.trace-detail').exists()).toBe(false)
   })
+
+  it('compact 模式按运行状态默认展开/收起，且手动选择优先', async () => {
+    const w = mount(AgentTrace, { props: { compact: true, entries: [entries[0]] } })
+    expect(w.find('.trace-list').exists()).toBe(false)
+    await w.setProps({ entries: [{ ...entries[0], status: 'running' }] })
+    expect(w.find('.trace-list').exists()).toBe(true)
+    await w.find('.trace-toggle').trigger('click')
+    await w.setProps({ entries: [{ ...entries[0], status: 'ok' }] })
+    expect(w.find('.trace-list').exists()).toBe(false)
+  })
+
+  it('新增轨迹步骤时保留已展开步骤，并支持键盘操作', async () => {
+    const w = mount(AgentTrace, { props: { entries: [entries[0]] } })
+    await w.find('.trace-main').trigger('keydown.enter')
+    expect(w.find('.trace-detail').exists()).toBe(true)
+    await w.setProps({ entries: [...entries, { seq: 3, agent: 'agent', tool: 'new_tool', status: 'ok' }] })
+    expect(w.findAll('.trace-detail')).toHaveLength(1)
+  })
 })

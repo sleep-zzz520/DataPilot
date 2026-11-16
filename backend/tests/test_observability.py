@@ -169,4 +169,5 @@ def test_metrics_endpoint_counts_requests(client):
     body = r.json()
     assert body["total_requests"] >= 3  # 加上 metrics 自身这 1 个
     assert "status_counts" in body and "latency_ms" in body
+    assert "query_cache" in body and "query_runtime" in body
     assert body["status_counts"].get("200", 0) >= 2

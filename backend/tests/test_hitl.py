@@ -49,14 +49,14 @@ def test_resolve_plan_pauses_then_resumes_saved_plan(isolated_storage, monkeypat
                         output_format="table", steps=[
                             {"id": "q", "title": "查询客户", "kind": "query"},
                         ])
-    monkeypatch.setattr("app.api.chat_api._build_plan", lambda *args: (plan, {"type": "plan"}))
+    monkeypatch.setattr("app.api.chat_api._build_plan", lambda *args, **kwargs: (plan, {"type": "plan"}))
     first = ChatRequest(message="导出客户数据为 CSV", session_id="s1", llm_config_id=1, db_config_id=1)
     user = {"uid": 7, "username": "alice"}
     pending = _resolve_plan(first, "s1", object(), object(), None, user)
     assert pending["kind"] == "confirmation"
 
     approval = pending["confirmation"]["approval_id"]
-    monkeypatch.setattr("app.api.chat_api._build_plan", lambda *args: (_ for _ in ()).throw(AssertionError("must reuse plan")))
+    monkeypatch.setattr("app.api.chat_api._build_plan", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must reuse plan")))
     resumed = _resolve_plan(
         first.model_copy(update={"approval_id": approval, "approval_decision": "approve"}),
         "s1", object(), object(), None, user,

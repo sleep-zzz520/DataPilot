@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -15,6 +17,10 @@ import duckdb
 from langchain_core.tools import tool
 from app.core.process_executor import LocalToolProcessError, LocalToolTimeoutError, run_in_process
 from app.core.timeouts import LOCAL_TOOL_TIMEOUT_SECONDS
+from app.db.query_cache import cacheable_sql, get_query_cache
+from app.db.query_runtime import record_query_runtime
+from app.db.sql_policy import SqlPolicyError, policy_message, validate_readonly_sql
+from app.security.data_policy import DataPolicy
 
 # 长工具输出压缩：查询结果 markdown 最多展示的行数（省 token）
 _TOOL_MAX_ROWS = 50
@@ -39,7 +45,8 @@ def _to_md(df: pd.DataFrame, max_rows: int = None) -> str:
     return "\n".join([head, sep, body])
 
 
-def _query_dataframe(df: pd.DataFrame, sql: str) -> tuple[str, int]:
+def _query_dataframe(df: pd.DataFrame, sql: str,
+                     sensitive_columns: Optional[List[str]] = None) -> tuple[str, int]:
     con = duckdb.connect(":memory:")
     try:
         con.execute("SET enable_external_access=false")
@@ -47,6 +54,8 @@ def _query_dataframe(df: pd.DataFrame, sql: str) -> tuple[str, int]:
         result = con.execute(sql).fetchdf()
     finally:
         con.close()
+    if sensitive_columns:
+        result, _ = DataPolicy(frozenset(), frozenset(sensitive_columns)).mask_dataframe(result)
     machine = {
         "columns": list(result.columns),
         "rows": result.head(200).where(result.notna(), None).values.tolist(),
@@ -67,9 +76,10 @@ def _read_uploaded_file(path: str) -> pd.DataFrame:
     return pd.read_csv(path) if suffix == ".csv" else pd.read_excel(path)
 
 
-def _query_file_path(path: str, sql: str) -> tuple[str, int]:
+def _query_file_path(path: str, sql: str,
+                     sensitive_columns: Optional[List[str]] = None) -> tuple[str, int]:
     """子进程入口：从受控上传路径读取文件，不复制主进程 DataFrame。"""
-    return _query_dataframe(_read_uploaded_file(path), sql)
+    return _query_dataframe(_read_uploaded_file(path), sql, sensitive_columns)
 
 
 def _file_stats_dataframe(df: pd.DataFrame, file: str) -> str:
@@ -95,23 +105,45 @@ def _file_stats_path(path: str, file: str) -> str:
 
 
 def make_file_tools(files: Dict[str, pd.DataFrame], audit_ctx: Optional[Dict] = None,
-                    file_paths: Optional[Dict[str, str]] = None) -> List:
+                    file_paths: Optional[Dict[str, str]] = None,
+                    cache_scope: Optional[str] = None,
+                    data_policy=None) -> List:
     """根据当前对话的上传文件构造文件分析工具。
 
     files: {文件名: DataFrame}
     audit_ctx: 可选 {"user_id","username","session_id"}，传入后 SQL 执行会写审计日志。
+    cache_scope: 结果缓存命名空间；仅对持久化上传文件启用。
+    data_policy: 用于敏感列识别；结果脱敏后才进入模型上下文。
     """
     if not files:
         return []
 
-    from app.audit import record, A_SQL_QUERY
+    from app.audit import record, A_DATA_MASK, A_SQL_QUERY
+    from app.security.data_policy import load_data_policy
     ctx = audit_ctx or {}
     paths = file_paths or {}
+    result_cache = get_query_cache() if cache_scope else None
+    data_policy = data_policy or load_data_policy()
+    sensitive_by_file = {
+        name: [str(column) for column in df.columns if data_policy.is_sensitive_column(column)]
+        for name, df in files.items()
+    }
 
-    def _audit_query(sql: str, rows: int, file: str):
+    def _audit_query(sql: str, rows: int, file: str, duration_ms: float,
+                     masked_columns=None):
         record(A_SQL_QUERY, ctx.get("user_id"), ctx.get("username"), {
             "sql": sql, "rows": rows, "source": f"file:{file}", "session_id": ctx.get("session_id"),
+            "duration_ms": round(max(0.0, float(duration_ms)), 2),
+            "masked_columns": list(masked_columns or []),
         })
+
+    def _masked_output_columns(output: str, candidates: list[str]) -> list[str]:
+        try:
+            machine = json.loads(output.split("<!--TABLE:", 1)[1].rstrip("-->"))
+            result_columns = {str(column).lower() for column in machine.get("columns") or []}
+        except (IndexError, ValueError, json.JSONDecodeError):
+            return []
+        return [column for column in candidates if str(column).lower() in result_columns]
 
     @tool
     def list_files() -> str:
@@ -139,29 +171,69 @@ def make_file_tools(files: Dict[str, pd.DataFrame], audit_ctx: Optional[Dict] = 
             return "错误：query_file 只支持 SELECT 查询。"
         if ";" in sql2:
             return "错误：只允许单条 SQL，不要使用分号。"
-        if "limit" not in sql2.lower():
-            sql2 += " LIMIT 500"
         try:
-            path = paths.get(file)
-            result, rows = (
-                run_in_process(
-                    _query_file_path,
-                    path,
-                    sql2,
-                    timeout_seconds=LOCAL_TOOL_TIMEOUT_SECONDS,
-                ) if path else _query_dataframe(df, sql2)
+            sql2 = validate_readonly_sql(
+                sql2, dialect="duckdb", default_limit=500, allowed_tables={"df"},
             )
+        except SqlPolicyError as exc:
+            return policy_message(exc, tool="file")
+        source_sensitive = list(sensitive_by_file.get(file) or [])
+        query_sensitive = sorted(
+            set(source_sensitive)
+            | data_policy.sensitive_columns_for_sql(
+                sql2, dialect="duckdb", source_columns=source_sensitive,
+            )
+        )
+        cache_key = None
+        path = paths.get(file)
+        if result_cache is not None and path and cacheable_sql(sql2):
+            try:
+                stat = os.stat(path)
+                namespace = f"{cache_scope}|{file}|{path}|{stat.st_mtime_ns}|{stat.st_size}"
+                cache_key = result_cache.make_key(namespace, sql2, "file")
+                cached = result_cache.get(cache_key)
+                if cached is not None:
+                    return cached
+            except OSError:
+                cache_key = None
+        try:
+            started = time.perf_counter()
+            if path:
+                args = (_query_file_path, path, sql2) + ((query_sensitive,) if query_sensitive else ())
+                result, rows = run_in_process(*args, timeout_seconds=LOCAL_TOOL_TIMEOUT_SECONDS)
+            else:
+                result, rows = (
+                    _query_dataframe(df, sql2, query_sensitive)
+                    if query_sensitive else _query_dataframe(df, sql2)
+                )
+            duration_ms = (time.perf_counter() - started) * 1000
+            masked_columns = _masked_output_columns(result, query_sensitive)
+            if masked_columns and ctx:
+                record(A_DATA_MASK, ctx.get("user_id"), ctx.get("username"), {
+                    "source": f"file:{file}", "columns": masked_columns,
+                    "session_id": ctx.get("session_id"),
+                })
             if ctx:
-                _audit_query(sql2, rows, file)
+                _audit_query(sql2, rows, file, duration_ms, masked_columns)
+            record_query_runtime("file", duration_ms, rows=rows,
+                                 audit_ctx=ctx, sql=sql2)
+            if cache_key is not None:
+                result_cache.set(cache_key, result)
             return result
         except LocalToolTimeoutError:
+            record_query_runtime("file", (time.perf_counter() - started) * 1000,
+                                 ok=False, audit_ctx=ctx, sql=sql2)
             return (
                 "[TOOL_TIMEOUT] query_file 上传文件查询超时。"
                 "请缩小文件范围、简化 SQL 或拆分文件后重试。"
             )
         except LocalToolProcessError as exc:
+            record_query_runtime("file", (time.perf_counter() - started) * 1000,
+                                 ok=False, audit_ctx=ctx, sql=sql2)
             return f"文件查询进程异常：{exc}"
         except Exception as e:
+            record_query_runtime("file", (time.perf_counter() - started) * 1000,
+                                 ok=False, audit_ctx=ctx, sql=sql2)
             return f"SQL 执行错误：{e}  请修正 SQL 后重试。"
 
     @tool

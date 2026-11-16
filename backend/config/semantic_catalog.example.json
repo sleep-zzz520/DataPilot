@@ -1,0 +1,83 @@
+{
+  "version": "1",
+  "tables": [
+    {
+      "name": "share-order.orders",
+      "description": "订单主表，一行一个订单；金额字段为含税口径",
+      "synonyms": ["订单", "交易", "order", "sales"],
+      "domain": "sales",
+      "owner": "data-team",
+      "freshness": "T+1",
+      "columns": [
+        {"name": "id", "type": "bigint", "description": "订单ID", "key": "PRI"},
+        {"name": "customer_id", "type": "bigint", "description": "客户ID"},
+        {"name": "region", "type": "varchar(32)", "description": "销售区域", "synonyms": ["地区", "区域"], "sample_values": ["East", "West"]},
+        {"name": "status", "type": "varchar(16)", "description": "订单状态", "sample_values": ["paid", "refunded", "cancelled"]},
+        {"name": "sales_amount", "type": "decimal(18,2)", "description": "含税销售额", "synonyms": ["销售额", "营收", "GMV"]},
+        {"name": "refund_amount", "type": "decimal(18,2)", "description": "退款金额"},
+        {"name": "cost_amount", "type": "decimal(18,2)", "description": "总成本（含费用和税）"},
+        {"name": "created_at", "type": "datetime", "description": "下单时间"}
+      ],
+      "unique_keys": [["id"]]
+    },
+    {
+      "name": "share-order.customers",
+      "description": "客户维表，一行一个客户",
+      "synonyms": ["客户", "用户", "customer"],
+      "domain": "sales",
+      "sensitive": true,
+      "columns": [
+        {"name": "id", "type": "bigint", "description": "客户ID", "key": "PRI"},
+        {"name": "name", "type": "varchar(128)", "description": "客户名称", "sensitive": true},
+        {"name": "phone", "type": "varchar(32)", "description": "客户手机号", "sensitive": true},
+        {"name": "region", "type": "varchar(32)", "description": "客户所属区域", "synonyms": ["地区"]}
+      ],
+      "unique_keys": [["id"]]
+    }
+  ],
+  "metrics": [
+    {
+      "id": "sales.net_sales",
+      "name": "净销售额",
+      "synonyms": ["净销售额", "净收入", "net sales"],
+      "description": "含税销售额减退款，仅统计已支付订单",
+      "formula": "SUM(sales_amount) - SUM(refund_amount)",
+      "source": "share-order.orders",
+      "required_columns": ["sales_amount", "refund_amount"],
+      "filters": ["status = 'paid'"],
+      "grain": "按查询粒度",
+      "unit": "CNY",
+      "contract_id": "sales.net_sales"
+    },
+    {
+      "id": "sales.net_profit",
+      "name": "净利润",
+      "synonyms": ["净利润", "利润", "net profit"],
+      "description": "净销售额减去总成本；成本口径需业务方确认",
+      "formula": "SUM(sales_amount) - SUM(refund_amount) - SUM(cost_amount)",
+      "source": "share-order.orders",
+      "required_columns": ["sales_amount", "refund_amount", "cost_amount"],
+      "filters": ["status = 'paid'"],
+      "unit": "CNY",
+      "contract_id": "sales.net_profit"
+    }
+  ],
+  "joins": [
+    {
+      "left": "share-order.orders",
+      "right": "share-order.customers",
+      "left_on": ["customer_id"],
+      "right_on": ["id"],
+      "cardinality": "many_to_one",
+      "description": "订单关联客户维表"
+    }
+  ],
+  "verified_queries": [
+    {
+      "question": "上个月各区域的净销售额",
+      "sql": "SELECT region, SUM(sales_amount) - SUM(refund_amount) AS net_sales FROM `share-order`.`orders` WHERE status = 'paid' AND created_at >= '2026-10-01' GROUP BY region",
+      "tables": ["share-order.orders"],
+      "description": "净销售额按区域汇总的已验证写法"
+    }
+  ]
+}

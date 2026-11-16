@@ -181,3 +181,37 @@ def test_query_mysql_short_output_not_omitted(monkeypatch):
     out = tools["query_mysql"].invoke({"sql": "SELECT * FROM t"})
     assert "已省略" not in out
     assert "| 9 |" in out
+
+
+def test_allowed_schemas_scopes_metadata_tools():
+    tools = {t.name: t for t in make_tools(engine=None, allowed_schemas={'share-order'})}
+    assert tools['list_schemas'].invoke({}) == 'share-order'
+    assert '不在本次授权范围内' in tools['get_schema'].invoke({'schema': 'share-device'})
+    assert '不在本次授权范围内' in tools['get_table_schema'].invoke(
+        {'schema': 'share-device', 'tables': ['orders']})
+
+
+def test_query_mysql_selects_default_schema_only_for_unqualified_table(monkeypatch):
+    seen = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def exec_driver_sql(self, statement):
+            seen.append(statement)
+
+    class Engine:
+        def connect(self):
+            return Connection()
+
+    monkeypatch.setattr(pd, 'read_sql', lambda sql, conn: _df())
+    tools = {t.name: t for t in make_tools(engine=Engine(), default_schema='share-order')}
+    tools['query_mysql'].invoke({'sql': 'SELECT * FROM orders'})
+    assert seen[0] == 'USE `share-order`'
+    seen.clear()
+    tools['query_mysql'].invoke({'sql': 'SELECT * FROM `share-order`.`orders`'})
+    assert all('USE' not in statement for statement in seen)

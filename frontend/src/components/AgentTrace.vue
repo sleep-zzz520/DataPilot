@@ -1,222 +1,99 @@
 <template>
-  <div v-if="entries.length" class="trace">
-    <div class="trace-head">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4"/>
-        <path d="M4.9 4.9l2.8 2.8m8.6 8.6l2.8 2.8m0-14.2l-2.8 2.8m-8.6 8.6l-2.8 2.8"/>
-      </svg>
-      Agent 调用轨迹
+  <section v-if="entries.length" class="trace" :class="{ compact }">
+    <button v-if="compact" class="trace-head trace-toggle" type="button" :aria-expanded="traceOpen" @click="toggleTrace">
+      <span class="trace-title">Agent 调用轨迹</span>
+      <span class="trace-count">{{ entries.length }} 步</span>
+      <svg class="trace-chevron" :class="{ open: traceOpen }" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+    </button>
+    <div v-else class="trace-head">
+      <span class="trace-title">Agent 调用轨迹</span>
       <span class="trace-count">{{ entries.length }} 步</span>
     </div>
-    <div class="trace-list">
-      <div
-        v-for="e in entries"
-        :key="e.seq"
-        class="trace-step"
-        :class="['depth-' + Math.min(e.depth || 0, 5), e.status]"
-        @click="toggle(e.seq)"
-      >
-        <div class="trace-main">
+    <div v-if="!compact || traceOpen" class="trace-list">
+      <div v-for="e in entries" :key="e.seq" class="trace-step" :class="['depth-' + Math.min(e.depth || 0, 5), e.status]" @click="toggle(e.seq)">
+        <div class="trace-main" role="button" tabindex="0" :aria-expanded="expanded.has(e.seq)" @keydown.enter.prevent.stop="toggle(e.seq)" @keydown.space.prevent.stop="toggle(e.seq)">
           <span class="trace-dot" :class="e.status"></span>
           <span class="trace-agent" :class="agentClass(e.agent)">{{ agentLabel(e.agent) }}</span>
           <span class="trace-tool">{{ e.tool }}</span>
           <span class="trace-status" :class="e.status">{{ statusLabel(e.status) }}</span>
           <span v-if="e.duration_ms != null" class="trace-dur">{{ e.duration_ms }}ms</span>
-          <svg class="trace-chevron" :class="{ open: expanded.has(e.seq) }" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="6 9 12 15 18 9"/>
-          </svg>
+          <svg class="step-chevron" :class="{ open: expanded.has(e.seq) }" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
         </div>
         <div v-if="expanded.has(e.seq)" class="trace-detail">
-          <div class="trace-field">
-            <span class="trace-label">入参</span>
-            <pre class="trace-code">{{ e.input || '(空)' }}</pre>
-          </div>
-          <div class="trace-field">
-            <span class="trace-label">结果</span>
-            <pre class="trace-code">{{ e.output || (e.status === 'running' ? '执行中…' : '(空)') }}</pre>
-          </div>
+          <div class="trace-field"><span class="trace-label">入参</span><pre class="trace-code">{{ e.input || '(空)' }}</pre></div>
+          <div class="trace-field"><span class="trace-label">结果</span><pre class="trace-code">{{ e.output || (e.status === 'running' ? '执行中…' : '(空)') }}</pre></div>
         </div>
       </div>
     </div>
-  </div>
+  </section>
 </template>
 
 <script setup>
 import { ref, watch } from 'vue'
 
 const props = defineProps({
-  entries: { type: Array, default: () => [] }
+  entries: { type: Array, default: () => [] },
+  compact: { type: Boolean, default: false }
 })
 
-// 展开态：按 seq 记录，默认折叠（保持气泡紧凑，点击任意一行展开/收起）
 const expanded = ref(new Set())
-watch(() => props.entries.length, () => { expanded.value = new Set() })
+const traceOpen = ref(false)
+let traceOpenManuallySet = false
+
+watch(() => props.entries.some(entry => entry.status === 'running'), running => {
+  if (!traceOpenManuallySet) traceOpen.value = running
+}, { immediate: true })
 
 function toggle(seq) {
-  const s = new Set(expanded.value)
-  s.has(seq) ? s.delete(seq) : s.add(seq)
-  expanded.value = s
+  const next = new Set(expanded.value)
+  next.has(seq) ? next.delete(seq) : next.add(seq)
+  expanded.value = next
+}
+
+function toggleTrace() {
+  traceOpenManuallySet = true
+  traceOpen.value = !traceOpen.value
 }
 
 const AGENT_LABELS = {
-  supervisor: '主管',
-  analysis_planner: '分析规划',
-  data_executor: '数据执行',
-  statistical_validator: '统计验证',
-  insight_writer: '洞察表达',
-  agent: 'Agent'
+  supervisor: '主管', analysis_planner: '分析规划', data_executor: '数据执行',
+  statistical_validator: '统计验证', insight_writer: '洞察表达', agent: 'Agent'
 }
-
-function agentLabel(name) {
-  return AGENT_LABELS[name] || name || 'Agent'
-}
-
-function agentClass(name) {
-  return 'agent-' + (AGENT_LABELS[name] ? name : 'other')
-}
-
-function statusLabel(s) {
-  return { ok: '成功', error: '失败', running: '执行中' }[s] || s
-}
+function agentLabel(name) { return AGENT_LABELS[name] || name || 'Agent' }
+function agentClass(name) { return 'agent-' + (AGENT_LABELS[name] ? name : 'other') }
+function statusLabel(status) { return { ok: '成功', error: '失败', running: '执行中' }[status] || status }
 </script>
 
 <style scoped>
-.trace {
-  margin: 12px 0 4px;
-  border: 1px solid #ECEDEF;
-  border-radius: 10px;
-  background: #FCFCFD;
-  overflow: hidden;
-}
-.trace-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  background: #F7F8FA;
-  border-bottom: 1px solid #ECEDEF;
-}
-.trace-head svg { color: var(--brand-start); }
-.trace-count {
-  margin-left: auto;
-  font-weight: 500;
-  color: var(--text-tertiary);
-  background: #fff;
-  border: 1px solid #E5E6EB;
-  border-radius: 999px;
-  padding: 1px 8px;
-  font-size: 11px;
-}
-
-.trace-list { padding: 4px 0; }
-.trace-step { cursor: pointer; transition: background 0.15s ease; }
-.trace-step:hover { background: #F7F8FA; }
-
-.trace-main {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  font-size: 12.5px;
-}
-.trace-dot {
-  flex: none;
-  width: 7px; height: 7px;
-  border-radius: 50%;
-  background: #C0C4CC;
-}
-.trace-dot.ok { background: #34C759; }
-.trace-dot.error { background: #EF4444; }
-.trace-dot.running { background: #F59E0B; }
-
-.trace-agent {
-  flex: none;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 1px 7px;
-  border-radius: 999px;
-  background: #F0F1F3;
-  color: var(--text-secondary);
-}
-.trace-agent.agent-supervisor { background: #1F1F1F; color: #fff; }
-.trace-agent.agent-analysis_planner { background: #FFF1E6; color: #C2410C; }
-.trace-agent.agent-data_executor { background: #E8F0FE; color: #1A56DB; }
-.trace-agent.agent-statistical_validator { background: #E6F7EE; color: #15803D; }
-.trace-agent.agent-insight_writer { background: #F3E8FF; color: #9333EA; }
-.trace-agent.agent-agent { background: #FEF3C7; color: #B45309; }
-
-.trace-tool {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.trace-status {
-  flex: none;
-  font-size: 11px;
-  color: var(--text-tertiary);
-}
-.trace-status.ok { color: #34C759; }
-.trace-status.error { color: #EF4444; }
-.trace-status.running { color: #F59E0B; }
-.trace-dur {
-  flex: none;
-  font-size: 11px;
-  color: var(--text-tertiary);
-  font-variant-numeric: tabular-nums;
-}
-.trace-chevron {
-  margin-left: auto;
-  flex: none;
-  color: var(--text-tertiary);
-  transition: transform 0.2s ease;
-}
-.trace-chevron.open { transform: rotate(180deg); }
-
-/* 层级缩进：专家内部工具比主管入口深一级 */
-.trace-step.depth-1 .trace-main { padding-left: 26px; }
-.trace-step.depth-2 .trace-main { padding-left: 40px; }
-.trace-step.depth-3 .trace-main { padding-left: 54px; }
-.trace-step.depth-4 .trace-main { padding-left: 68px; }
-.trace-step.depth-5 .trace-main { padding-left: 82px; }
-
-.trace-detail {
-  padding: 0 12px 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.trace-step.depth-1 .trace-detail { padding-left: 26px; }
-.trace-field {
-  display: flex;
-  gap: 8px;
-  align-items: flex-start;
-}
-.trace-label {
-  flex: none;
-  font-size: 11px;
-  color: var(--text-tertiary);
-  padding-top: 3px;
-}
-.trace-code {
-  flex: 1;
-  margin: 0;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  line-height: 1.5;
-  color: var(--text-secondary);
-  background: #F4F5F7;
-  border: 1px solid #ECEDEF;
-  border-radius: 6px;
-  padding: 6px 8px;
-  white-space: pre-wrap;
-  word-break: break-all;
-  max-height: 160px;
-  overflow-y: auto;
-}
+.trace { margin: 12px 0 4px; color: var(--text-primary); }
+.trace-head { display: flex; width: 100%; align-items: center; gap: 8px; padding: 7px 0; color: var(--text-secondary); font: inherit; font-size: 12px; font-weight: 600; text-align: left; }
+.trace-toggle { border: 0; background: transparent; cursor: pointer; }
+.trace-toggle:hover { color: var(--text-primary); }
+.trace-title { min-width: 0; }
+.trace-count { margin-left: auto; color: var(--text-tertiary); font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.trace-chevron, .step-chevron { flex: none; color: var(--text-tertiary); transition: transform .18s ease; }
+.trace-chevron.open, .step-chevron.open { transform: rotate(180deg); }
+.trace-list { border-top: 1px solid var(--border-color); }
+.trace-step { border-bottom: 1px solid var(--border-color); }
+.trace-main { display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 5px 4px; font-size: 12px; cursor: pointer; transition: background .15s ease; }
+.trace-main:hover { background: var(--bg-tertiary, #f8f6f2); }
+.trace-main:focus-visible, .trace-toggle:focus-visible { outline: 2px solid #9a6b43; outline-offset: 2px; border-radius: 4px; }
+.trace-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: #aaa49b; }
+.trace-dot.ok { background: #71816e; }.trace-dot.error { background: #b65e4e; }.trace-dot.running { background: #b17a3e; }
+.trace-agent { flex: none; border-radius: 4px; padding: 2px 6px; background: #efede8; color: #625b51; font-size: 10px; font-weight: 600; }
+.trace-agent.agent-supervisor { background: #e8e3dc; color: #403a34; }
+.trace-agent.agent-analysis_planner { background: #f4e8da; color: #815b37; }
+.trace-agent.agent-data_executor { background: #e8ecee; color: #52636b; }
+.trace-agent.agent-statistical_validator { background: #eeeae0; color: #72684f; }
+.trace-agent.agent-insight_writer { background: #eee8e2; color: #786456; }
+.trace-agent.agent-agent { background: #f2eadb; color: #81683f; }
+.trace-tool { overflow: hidden; color: var(--text-primary); font-family: var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.trace-status { flex: none; color: var(--text-tertiary); font-size: 11px; }.trace-status.ok { color: #647660; }.trace-status.error { color: #a64f42; }.trace-status.running { color: #986b33; }
+.trace-dur { flex: none; color: var(--text-tertiary); font-size: 11px; font-variant-numeric: tabular-nums; }
+.step-chevron { margin-left: auto; }
+.trace-step.depth-1 .trace-main { padding-left: 20px; }.trace-step.depth-2 .trace-main { padding-left: 36px; }.trace-step.depth-3 .trace-main { padding-left: 52px; }.trace-step.depth-4 .trace-main { padding-left: 68px; }.trace-step.depth-5 .trace-main { padding-left: 84px; }
+.trace-detail { display: grid; gap: 7px; padding: 2px 8px 10px 20px; }
+.trace-field { display: flex; align-items: flex-start; gap: 10px; }
+.trace-label { flex: none; padding-top: 4px; color: var(--text-tertiary); font-size: 11px; }
+.trace-code { flex: 1; max-height: 160px; overflow: auto; margin: 0; border-left: 2px solid #e3ded6; padding: 5px 9px; background: var(--bg-secondary, #f5f3ef); color: var(--text-secondary); font-family: var(--font-mono); font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
 </style>

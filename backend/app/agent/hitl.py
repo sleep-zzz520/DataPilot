@@ -44,7 +44,17 @@ def _text(value: Any) -> str:
     return str(value)
 
 
-def assess_confirmation(question: str, plan, file_metadata: Optional[List[Dict[str, Any]]] = None) -> dict:
+def _mentions_sensitive_table(text: str, tables) -> bool:
+    lowered = str(text or "").lower()
+    for table in tables or ():
+        bare = str(table or "").strip().strip("`").lower().rsplit(".", 1)[-1]
+        if bare and re.search(rf"(?<![a-z0-9_]){re.escape(bare)}(?![a-z0-9_])", lowered):
+            return True
+    return False
+
+
+def assess_confirmation(question: str, plan, file_metadata: Optional[List[Dict[str, Any]]] = None,
+                        sensitive_tables=None) -> dict:
     """根据计划和请求做确定性风险判断，返回前端可直接展示的确认摘要。"""
     plan_text = _text(plan.model_dump(exclude_none=True))
     file_columns = _text([item.get("columns", []) for item in (file_metadata or [])])
@@ -62,7 +72,8 @@ def assess_confirmation(question: str, plan, file_metadata: Optional[List[Dict[s
         reasons.append("high_cost")
     if _EXPORT.search(question) or plan.output_format == "report":
         reasons.append("data_export")
-    if _SENSITIVE.search(all_text) or _SENSITIVE_SOURCE.search(all_text):
+    if (_SENSITIVE.search(all_text) or _SENSITIVE_SOURCE.search(all_text)
+            or _mentions_sensitive_table(plan_text, sensitive_tables)):
         reasons.append("sensitive_data")
 
     if not reasons:

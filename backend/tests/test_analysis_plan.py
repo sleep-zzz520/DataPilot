@@ -98,6 +98,7 @@ def test_unconstrained_plan_accepts_real_evidence_without_where_or_order_by():
     table = '<!--TABLE:{"columns":["total"],"rows":[[230]]}-->'
     for sort, time_range in [
         ([], {"type": "all"}), ("无", "全部数据"),
+        (None, {"type": "none"}),
         (None, {"start": None, "end": None}),
         ("无需排序", {"type": "all", "start": None, "end": None}),
         (None, {"type": "all", "description": "未指定时间范围，统计全部数据"}),
@@ -114,3 +115,40 @@ def test_unconstrained_plan_accepts_real_evidence_without_where_or_order_by():
     issues = runtime.after_tool("query_file", {"sql": sql}, table)
     assert "查询未体现计划中的时间范围" in issues
     assert "查询未体现计划要求的排序" in issues
+
+
+def test_raw_metric_does_not_require_group_by():
+    sql = "SELECT day, kwh FROM df ORDER BY day ASC"
+    table = ('<!--TABLE:{"columns":["day","kwh"],"rows":'
+             '[["2026-01-01",10],["2026-01-02",15]]}-->')
+    plan = AnalysisPlan(
+        goal="按日期展示用电趋势", metrics=["kwh"], dimensions=["day"], grain="day",
+        sort=[{"field": "day", "order": "asc"}], time_range={"type": "none"},
+    )
+    runtime = PlanRuntime(plan, "按日期画 energy.csv 用电趋势折线图，并返回 day,kwh")
+    assert runtime.after_tool("query_file", {"sql": sql}, table) == []
+
+
+def test_aggregate_metric_still_requires_group_by():
+    table = ('<!--TABLE:{"columns":["region","amount"],"rows":'
+             '[["east",120],["west",80]]}-->')
+    plan = AnalysisPlan(
+        goal="按区域汇总金额",
+        metrics=[{"name": "total", "expression": "SUM(amount)", "aggregation": "sum"}],
+        dimensions=["region"], grain="region",
+    )
+    runtime = PlanRuntime(plan, "按区域汇总金额")
+    issues = runtime.after_tool("query_file", {"sql": "SELECT region, amount FROM df"}, table)
+    assert "查询未体现计划要求的聚合粒度" in issues
+
+
+def test_metadata_dimensions_do_not_require_business_columns():
+    from app.agent.analysis_plan import AnalysisPlan, PlanRuntime, PlanStep
+    plan = AnalysisPlan(goal="列出当前表", dimensions=["schema", "table_name"],
+                        steps=[PlanStep(id="s", title="读取目录", kind="load_schema")])
+    PlanRuntime(plan, columns=["order_id", "amount"])
+    assert not plan.quality_issues
+    query = AnalysisPlan(goal="按不存在的维度查询", dimensions=["schema"],
+                         steps=[PlanStep(id="q", title="查询", kind="query")])
+    PlanRuntime(query, columns=["order_id", "amount"])
+    assert any(item["code"] == "missing_dimension" for item in query.active_issues)

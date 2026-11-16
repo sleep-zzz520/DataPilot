@@ -37,6 +37,14 @@ A_USER_ACTION = "user_action"        # 注册/登录/改密/注销/角色变更
 A_SESSION_ACTION = "session_action"  # 会话删除/重命名/清空
 A_FILE_UPLOAD = "file_upload"        # 上传文件
 A_HITL_CONFIRMATION = "hitl_confirmation"  # 高风险分析确认/拒绝
+A_FEEDBACK = "feedback"              # 回答反馈 / Fix with AI 请求
+A_VERIFIED_QUERY = "verified_query"  # 已验证查询保存/删除
+A_ASYNC_TASK = "async_task"          # 长任务提交/取消
+A_SLOW_QUERY = "slow_query"          # 超过阈值的查询耗时
+A_SENSITIVE_ACCESS = "sensitive_access"  # 敏感表访问允许/拒绝
+A_DATA_MASK = "data_mask"            # 结果列脱敏
+A_ARTIFACT = "artifact"              # 分析产物导出/复跑/删除
+A_EXPORT = "report_export"           # 报告导出
 
 
 def _connect() -> sqlite3.Connection:
