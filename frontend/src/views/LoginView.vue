@@ -5,8 +5,8 @@
       <p v-if="isRegister" class="login-tip">
         新注册账号为<b>普通用户</b>；系统<b>首个注册</b>的账号自动成为<b>管理员</b>（可管理全局配置与用户）。
       </p>
-      <p v-if="!isRegister && showTestCredentials" class="login-tip test-credentials">
-        测试管理员：<b>admin</b> / <b>admin1234</b>
+      <p v-if="!isRegister" class="login-tip test-credentials">
+        测试管理员：<b>{{ testAccount.username }}</b> / <b>{{ testAccount.password }}</b>
       </p>
       <form @submit.prevent="submit">
         <div class="field">
@@ -19,11 +19,11 @@
         </div>
         <p v-if="error" class="login-error" role="alert">{{ error }}</p>
         <button type="submit" class="login-btn" :disabled="loading">
-          {{ loading && !creatingTestAccount ? '请稍候...' : (isRegister ? '注册并登录' : '登录') }}
+          {{ loading && !loggingInTestAccount ? '请稍候...' : (isRegister ? '注册并登录' : '登录') }}
         </button>
       </form>
-      <button type="button" class="login-btn test-account-btn" :disabled="loading" @click="addTestAccount">
-        {{ creatingTestAccount ? '正在创建...' : '快速添加测试账号' }}
+      <button type="button" class="login-btn test-account-btn" :disabled="loading" @click="loginTestAccount">
+        {{ loggingInTestAccount ? '正在登录...' : '使用管理员测试账号登录' }}
       </button>
       <p class="login-switch">
         {{ isRegister ? '已有账号？' : '还没有账号？' }}
@@ -44,8 +44,9 @@ const username = ref('')
 const password = ref('')
 const error = ref('')
 const loading = ref(false)
-const creatingTestAccount = ref(false)
-const showTestCredentials = import.meta.env.DEV
+const loggingInTestAccount = ref(false)
+// 只复用预置账号；账号不存在或密码错误时交给普通登录接口报错。
+const testAccount = { username: 'admin', password: 'admin1234' }
 
 function toggleMode() {
   isRegister.value = !isRegister.value
@@ -59,23 +60,19 @@ function completeLogin(res) {
   router.push('/chat')
 }
 
-async function addTestAccount() {
+async function loginTestAccount() {
   if (loading.value) return
   loading.value = true
-  creatingTestAccount.value = true
+  loggingInTestAccount.value = true
   error.value = ''
   try {
-    // 每次创建独立账号，权限与审计沿用普通注册流程。
-    const random = Array.from(crypto.getRandomValues(new Uint8Array(24)), byte => byte.toString(16).padStart(2, '0')).join('')
-    username.value = `test_${random.slice(0, 16)}`
-    password.value = random.slice(16)
-    const res = await authApi.register(username.value, password.value)
+    const res = await authApi.login(testAccount.username, testAccount.password)
     completeLogin(res)
   } catch (err) {
-    error.value = err.suggestion || err.message || '测试账号创建失败，请重试'
+    error.value = err.suggestion || err.message || '测试账号登录失败，请重试'
   } finally {
     loading.value = false
-    creatingTestAccount.value = false
+    loggingInTestAccount.value = false
   }
 }
 

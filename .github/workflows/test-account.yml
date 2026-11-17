@@ -1,0 +1,48 @@
+name: Maintain test account
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Inspect accounts or consolidate generated test accounts
+        type: choice
+        required: true
+        default: inspect
+        options:
+          - inspect
+          - consolidate
+
+concurrency:
+  group: dataanalysis-agent-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  maintain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure the existing deployment connection
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+      - name: Maintain the existing test account
+        env:
+          ACCOUNT_ACTION: ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+          case "$ACCOUNT_ACTION" in inspect|consolidate) ;; *) exit 1 ;; esac
+          ssh -i "$HOME/.ssh/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            github-deploy@121.43.124.98 \
+            "cd /opt/dataanalysis-agent-20260910 && docker compose exec -T backend python - --database /app/data/chat_history.db --action '$ACCOUNT_ACTION'" \
+            < backend/scripts/maintain_test_account.py
