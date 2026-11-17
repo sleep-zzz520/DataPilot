@@ -73,3 +73,12 @@ def test_no_existing_test_account_is_not_created(tmp_path):
     with pytest.raises(ValueError, match="不会自动注册"):
         consolidate(path)
     assert len(inspect_accounts(path)["users"]) == 3
+
+
+def test_explicitly_include_legacy_test_user_without_removing_other_users(tmp_path):
+    path = make_database(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("INSERT INTO users VALUES(4,'user1','user','old')")
+    result = consolidate(path, additional_test_users=["user1"])
+    assert result["removed_accounts"] == 2
+    assert [u["username"] for u in inspect_accounts(path)["users"]] == ['admin', 'analyst']

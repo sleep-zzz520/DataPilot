@@ -34,7 +34,7 @@ def inspect_accounts(database: Path) -> dict:
         return {"users": users, "data_by_owner": owners}
 
 
-def consolidate(database: Path) -> dict:
+def consolidate(database: Path, additional_test_users=()) -> dict:
     database = database.resolve()
     conn = sqlite3.connect(database.as_uri() + "?mode=rw", uri=True, timeout=30)
     backup_path = None
@@ -42,7 +42,8 @@ def consolidate(database: Path) -> dict:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("BEGIN IMMEDIATE")
         users = conn.execute("SELECT id, username, role, password_hash FROM users ORDER BY id").fetchall()
-        candidates = [u for u in users if u[1] == "admin" or TEST_NAME.fullmatch(u[1])]
+        candidates = [u for u in users if u[1] == "admin" or TEST_NAME.fullmatch(u[1])
+                      or u[1] in additional_test_users]
         if not candidates:
             raise ValueError("没有已有测试账号；本命令不会自动注册账号")
         keeper = next((u for u in candidates if u[1] == "admin"), None)
@@ -115,9 +116,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--action", choices=("inspect", "consolidate"), default="inspect")
+    parser.add_argument("--include-user", action="append", default=[],
+                        help="明确指定额外需要合并的旧测试账号，可重复传入")
     args = parser.parse_args()
     if args.action == "consolidate":
-        print(json.dumps(consolidate(args.database), ensure_ascii=False))
+        print(json.dumps(consolidate(args.database, args.include_user), ensure_ascii=False))
     print(json.dumps(inspect_accounts(args.database), ensure_ascii=False))
 
 

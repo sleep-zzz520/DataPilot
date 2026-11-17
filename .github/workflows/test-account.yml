@@ -11,6 +11,11 @@ on:
         options:
           - inspect
           - consolidate
+      include_user1:
+        description: Also consolidate the legacy user1 test account
+        type: boolean
+        required: true
+        default: false
 
 concurrency:
   group: dataanalysis-agent-production
@@ -39,10 +44,16 @@ jobs:
       - name: Maintain the existing test account
         env:
           ACCOUNT_ACTION: ${{ inputs.action }}
+          INCLUDE_USER1: ${{ inputs.include_user1 }}
         run: |
           set -euo pipefail
           case "$ACCOUNT_ACTION" in inspect|consolidate) ;; *) exit 1 ;; esac
+          case "$INCLUDE_USER1" in
+            true) account_options='--include-user user1' ;;
+            false) account_options='' ;;
+            *) exit 1 ;;
+          esac
           ssh -i "$HOME/.ssh/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=yes \
             github-deploy@121.43.124.98 \
-            "cd /opt/dataanalysis-agent-20260910 && docker compose exec -T backend python - --database /app/data/chat_history.db --action '$ACCOUNT_ACTION'" \
+            "cd /opt/dataanalysis-agent-20260910 && docker compose exec -T backend python - --database /app/data/chat_history.db --action '$ACCOUNT_ACTION' $account_options" \
             < backend/scripts/maintain_test_account.py
