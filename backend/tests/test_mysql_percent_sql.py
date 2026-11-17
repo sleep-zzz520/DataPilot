@@ -9,10 +9,9 @@ from sqlalchemy.pool import StaticPool
 from app.tools.agent_tools import _read_mysql_with_timeout
 
 
-class DriverConnection:
-    encoding = "utf8"
-
+class DriverConnection(pymysql.connections.Connection):
     def __init__(self):
+        super().__init__(host="localhost", user="root", defer_connect=True)
         self.statements = []
 
     def cursor(self):
