@@ -25,6 +25,7 @@ from app.memory.agent_memory import (
     save_analysis_record, delete_analysis_records,
 )
 from app.db.schema import list_tables
+from app.db.schema_cache import get_schema_cache
 from app.security.data_policy import load_data_policy
 from app.agent.analysis_plan import AnalysisPlan, make_analysis_plan_graph, PlanRuntime, plan_context
 from app.agent.contracts import MetricContractRegistry, ContractBinding, ValidationIssue, bind_metric_contracts
@@ -169,14 +170,35 @@ _IMAGE_RE = re.compile(r"<!--IMAGE_BASE64:(.*?)-->", re.S)
 def _build_plan(llm, engine, question: str, schema: Optional[str], file_ids: list, user_id: int,
                 memory_context: str = ""):
     """规划失败只降级，不阻断原有 Agent；返回计划和 SSE 事件。"""
+    catalog = []
     try:
-        catalog = list_tables(engine, schema)
-        for fid in file_ids:
-            meta = get_upload(str(fid), user_id)
-            if meta:
-                catalog.append({"name": meta["name"], "comment": "上传文件", "columns": meta.get("columns", [])})
+        if engine is not None:
+            catalog = [dict(item, columns_status="not_loaded") for item in list_tables(engine, schema)]
     except Exception:
-        catalog = []
+        pass
+    # ponytail: enrich at most 32 tables per plan; larger catalogs retain table
+    # discovery and load_schema steps instead of an unbounded schema prompt.
+    grouped = {}
+    for item in catalog[:32]:
+        source = item.get("name", "")
+        if "." in source:
+            source_schema, table = source.rsplit(".", 1)
+            grouped.setdefault(source_schema, []).append((table, item))
+    for source_schema, entries in grouped.items():
+        try:
+            metadata = get_schema_cache().get_columns(engine, source_schema, [t for t, _ in entries])
+        except Exception:
+            metadata = {}
+        for table, item in entries:
+            if table in metadata:
+                item.update(metadata[table], columns_status="loaded")
+            else:
+                item["columns_status"] = "unavailable"
+    for fid in file_ids:
+        meta = get_upload(str(fid), user_id)
+        if meta:
+            catalog.append({"name": meta["name"], "comment": "上传文件", "columns": meta.get("columns", []),
+                            "columns_status": "loaded"})
     result = make_analysis_plan_graph(llm).invoke({
         "question": (f"【当前选择的数据库】{schema}；以此为准，不沿用历史库名。\n{question}"
                      if schema else question),

@@ -78,6 +78,9 @@ def test_query_mysql_sets_mysql_server_execution_timeout(monkeypatch):
     seen = {}
 
     class Connection:
+        def execution_options(self, **kwargs):
+            return self
+
         def __enter__(self):
             return self
 
@@ -116,6 +119,9 @@ def test_query_mysql_invalidates_timed_out_connection(monkeypatch):
     seen = {"invalidated": None}
 
     class Connection:
+        def execution_options(self, **kwargs):
+            return self
+
         def __enter__(self):
             return self
 
@@ -195,6 +201,9 @@ def test_query_mysql_selects_default_schema_only_for_unqualified_table(monkeypat
     seen = []
 
     class Connection:
+        def execution_options(self, **kwargs):
+            return self
+
         def __enter__(self):
             return self
 

@@ -50,7 +50,10 @@ def _read_mysql_with_timeout(sql: str, engine, default_schema: str = None):
             conn.exec_driver_sql(
                 f"SET SESSION max_execution_time = {MYSQL_MAX_EXECUTION_TIME_MS}"
             )
-            return pd.read_sql(sql, conn)
+            # Generated SQL has no bound parameters. Omit the empty DBAPI parameter
+            # mapping so PyMySQL preserves DATE_FORMAT/LIKE percent signs verbatim.
+            # Keep the driver SQL path: text(sql) would reinterpret colon literals.
+            return pd.read_sql(sql, conn.execution_options(no_parameters=True))
         except Exception as exc:
             # read_timeout 可能留下半断开的 socket，不能把它归还给连接池复用。
             if _is_timeout_error(exc):

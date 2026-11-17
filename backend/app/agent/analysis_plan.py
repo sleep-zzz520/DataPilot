@@ -213,11 +213,17 @@ steps 中每项必须包含 id、title、kind、depends_on；kind 只能是
 discover_source/load_schema/query/calculate/validate/visualize/summarize。
 result_columns 只记录用户明确要求输出的列名（按原顺序），未指定时用 []。这些列是最终结果列，不是源字段；派生指标须在查询或计算步骤中产出。
 不确定指标口径时不要猜，设置 clarification_needed=true，并提出简短问题。
+指标口径是含税/未税、利润成本等业务定义；表名、字段名和关联键应由系统读取表结构确认，不要求用户提供。
+time_range 只记录用户限定的时间筛选范围；未限定时间时必须为 null。
+“最早/最晚下单日期”等 MIN/MAX 输出指标不是时间筛选，不能因此填写 time_range。
 候选表只是参考，不能编造不存在的表。
 
 【维度约束（必须遵守）】
 dimensions 和 filters 只能使用候选数据表中**真实存在的列**。
-如果用户要求的维度不在列列表里（例如要求按"性别"分组，但表中没有性别列），必须：
+columns_status=loaded 表示已读取真实列名、类型及注释，应直接使用已知字段。
+columns_status=not_loaded/unavailable 或未提供 columns 表示字段尚未加载，不表示字段不存在。
+字段尚未加载时安排 load_schema 步骤自行确认，不要仅因此设置 clarification_needed 或询问用户字段叫什么。
+只有已读取相关表结构，仍确认缺少用户要求的维度（例如要求按"性别"分组，但表中没有性别列），才必须：
     1) 不要把它写进 dimensions；
     2) 在 assumptions 中写明"数据源缺少【某字段】，无法支持该维度分析"；
     3) 设置 clarification_needed=true，并在 clarification_question 中询问用户如何处理。
