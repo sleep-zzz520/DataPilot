@@ -22,15 +22,21 @@ import os, pathlib, signal, subprocess, time
 path = pathlib.Path('/etc/ssh/sshd_config')
 original = path.read_text()
 marker = '# DataPilot local MySQL forwarding restrictions'
+old_block = chr(10).join(['', marker, 'Match User github-deploy',
+                         '    AllowTcpForwarding remote', '    AllowStreamLocalForwarding no', ''])
 block = chr(10).join(['', marker, 'Match User github-deploy',
-                     '    AllowTcpForwarding remote', '    AllowStreamLocalForwarding no', ''])
-changed = marker not in original
+                     '    AllowTcpForwarding remote', '    AllowStreamLocalForwarding no',
+                     '    ClientAliveInterval 30', '    ClientAliveCountMax 3', ''])
+if marker in original and old_block not in original and block not in original:
+    raise ValueError('Existing managed sshd block has unexpected contents')
+updated = original if block in original else original.replace(old_block, '', 1) + block
+changed = updated != original
 reloaded = False
 if changed:
     backup = pathlib.Path('/etc/ssh/sshd_config.before-datapilot-' + str(time.time_ns()))
     backup.write_text(original)
     backup.chmod(0o600)
-    path.write_text(original + block)
+    path.write_text(updated)
 try:
     subprocess.run(['/usr/sbin/sshd', '-t'], check=True)
     effective = subprocess.check_output([
@@ -39,6 +45,7 @@ try:
     settings = dict(line.split(' ', 1) for line in effective.splitlines())
     assert settings['allowtcpforwarding'] == 'remote', 'TCP forwarding restriction was not applied'
     assert settings['allowstreamlocalforwarding'] == 'no', 'Unix forwarding must be disabled'
+    assert settings['clientaliveinterval'] == '30' and settings['clientalivecountmax'] == '3'
     if changed:
         pid = int(pathlib.Path(settings['pidfile']).read_text().strip())
         if pid <= 1:
@@ -105,7 +112,8 @@ def restrict_forwarding() -> None:
                  "os.execv('/usr/bin/python3',['python3','-c',sys.argv[1]])")
     subprocess.run([
         "docker", "run", "--rm", "--user", "0:0", "--pid", "host", "--network", "none",
-        "--cap-drop", "ALL", "--cap-add", "SYS_CHROOT",
+        "--cap-drop", "ALL", "--cap-add", "SYS_CHROOT", "--cap-add", "KILL",
+        "--security-opt", "apparmor=unconfined",
         "--security-opt", "no-new-privileges=true",
         "--mount", "type=bind,src=/,dst=/host", "--entrypoint", "python", image,
         "-c", bootstrap, SSHD_RESTRICTIONS,
