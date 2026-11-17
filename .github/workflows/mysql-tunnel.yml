@@ -1,0 +1,50 @@
+name: Configure local MySQL tunnel
+
+on:
+  workflow_dispatch:
+    inputs:
+      public_key_base64:
+        description: Ed25519 public key body for the Mac reverse tunnel (never the private key)
+        type: string
+        required: true
+
+concurrency:
+  group: dataanalysis-agent-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  configure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Configure the existing deployment connection
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+      - name: Install the restricted reverse tunnel relay
+        env:
+          TUNNEL_PUBLIC_KEY: ${{ inputs.public_key_base64 }}
+        run: |
+          set -euo pipefail
+          [[ "$TUNNEL_PUBLIC_KEY" =~ ^[A-Za-z0-9+/=]{68}$ ]]
+          ssh_options=(-i "$HOME/.ssh/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          target=github-deploy@121.43.124.98
+          ssh "${ssh_options[@]}" "$target" 'mkdir -p "$HOME/.local/share/datapilot/mysql-tunnel" && chmod 700 "$HOME/.local/share/datapilot/mysql-tunnel"'
+          scp "${ssh_options[@]}" scripts/mysql_tunnel_proxy.py scripts/setup_mysql_tunnel.py \
+            "$target:.local/share/datapilot/mysql-tunnel/"
+          ssh "${ssh_options[@]}" "$target" \
+            "python3 .local/share/datapilot/mysql-tunnel/setup_mysql_tunnel.py --public-key-base64 '$TUNNEL_PUBLIC_KEY'"
+          ssh "${ssh_options[@]}" "$target" true
