@@ -20,6 +20,16 @@ _BARE_DASH = re.compile(r"(?<!`)(share-[A-Za-z0-9_]+)(?!`)")
 _TOOL_MAX_ROWS = 50
 
 
+def build_chart_option(chart_type: str, title: str, x_labels: list, series: list) -> dict:
+    if chart_type == "pie":
+        return {"title": {"text": title}, "tooltip": {"trigger": "item"}, "legend": {},
+                "series": [{"type": "pie", "radius": "60%", "data": series or []}]}
+    return {"title": {"text": title}, "tooltip": {"trigger": "axis"}, "legend": {},
+            "xAxis": {"type": "category", "data": x_labels or []}, "yAxis": {"type": "value"},
+            "series": [{"type": chart_type, "name": s.get("name", ""), "data": s.get("data", [])}
+                       for s in (series or [])]}
+
+
 def _is_timeout_error(exc: Exception) -> bool:
     text = f"{type(exc).__name__}: {exc}".lower()
     return any(marker in text for marker in (
@@ -211,14 +221,7 @@ def make_tools(engine, default_schema=None, files=None, audit_ctx=None, file_pat
     @tool
     def make_chart(chart_type: str, title: str, x_labels: list, series: list) -> str:
         """生成 ECharts 图表。chart_type∈bar/line/pie。bar/line：series=[{name,data:[...]}]；pie：series=[{name,value}]。"""
-        ct = (chart_type or "bar").lower()
-        if ct == "pie":
-            option = {"title": {"text": title}, "tooltip": {"trigger": "item"}, "legend": {},
-                      "series": [{"type": "pie", "radius": "60%", "data": series or []}]}
-        else:
-            option = {"title": {"text": title}, "tooltip": {"trigger": "axis"}, "legend": {},
-                      "xAxis": {"type": "category", "data": x_labels or []}, "yAxis": {"type": "value"},
-                      "series": [{"type": ct, "name": s.get("name", ""), "data": s.get("data", [])} for s in (series or [])]}
+        option = build_chart_option((chart_type or "bar").lower(), title, x_labels, series)
         return f"<!--CHART:{json.dumps(option, ensure_ascii=False)}-->图表已生成：{title}（前端会渲染，回复里不要重复罗列数据）"
 
     # 高级可视化工具

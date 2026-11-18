@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, re, json, io, uuid, threading, time
+import asyncio, re, json, io, math, uuid, threading, time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, List, Literal
@@ -13,7 +13,7 @@ from langchain_core.messages import (
 )
 from app.meta.store import get_llm_secret, get_db_secret
 from app.core.factories import build_llm, build_engine
-from app.tools.agent_tools import make_tools
+from app.tools.agent_tools import build_chart_option, make_tools
 from app.agent.multi_agent import make_agent
 from app.errors.classifier import classify_any
 from app.audit import record, A_FILE_UPLOAD, A_SESSION_ACTION, A_HITL_CONFIRMATION
@@ -403,6 +403,27 @@ def _extract(messages):
                     sql = tc.get("args", {}).get("sql") or sql
     return visuals, tables, sql
 
+def _bar_chart_from_result(question, table):
+    """Render a missing explicitly named bar chart from a verified result table."""
+    columns, rows = table["columns"], table["rows"]
+    if not 0 < len(rows) <= 50:
+        return None
+    metrics = [i for i, column in enumerate(columns) if re.search(
+        rf"(?:画(?:出)?|绘制|生成)\s*{re.escape(column)}\s*(?:的\s*)?柱状图", question)]
+    if len(metrics) != 1:
+        return None
+    metric = metrics[0]
+    values = [row[metric] for row in rows]
+    if not all(type(value) in (int, float) and math.isfinite(value) for value in values):
+        return None
+    labels = [cells for i, cells in enumerate(zip(*rows)) if i != metric and
+              all(isinstance(cell, str) and cell.strip() for cell in cells) and len(set(cells)) == len(rows)]
+    if len(labels) != 1:
+        return None
+    title = f"{columns[metric]}柱状图"
+    return build_chart_option("bar", title, list(labels[0]), [{"name": columns[metric], "data": values}])
+
+
 def _display_result(messages, reply, runtime, trace=()):
     visuals, tables, sql = _extract(messages)
     status = runtime.validation_status
@@ -416,6 +437,15 @@ def _display_result(messages, reply, runtime, trace=()):
     if table is not None:
         tables = [table]
         sql = table.get("executed_sql")
+        if status == "approved" and not runtime.has_contracts and not visuals:
+            chart = _bar_chart_from_result(runtime.question, table)
+            if chart is not None:
+                visuals = [{"chart": chart}]
+                reply = "已根据通过验证的查询结果生成表格和柱状图。"
+                chart_steps = [step for step in runtime.plan.steps if step.kind == "visualize"]
+                if len(chart_steps) == 1 and chart_steps[0].status == "pending":
+                    chart_steps[0].status = "succeeded"
+                    chart_steps[0].output = {"source": "verified_result_table"}
     elif status == "approved" and runtime.plan.result_columns:
         columns = "、".join(runtime.plan.result_columns)
         return f"本轮未取得包含所需列（{columns}）的完整查询结果，暂不提供结论。", [], [], None
