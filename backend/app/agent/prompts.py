@@ -44,6 +44,7 @@ _NUMERIC_EVIDENCE = """
 【数字依据】
 只引用本轮查询或统计工具已经给出的数字。按月结果只提供各月数值，不能凭这些数值心算全年合计、平均值或增幅。
 用户明确要求的汇总需要由查询或统计工具计算。未要求且证据中没有的汇总直接省略，可描述表中可见的高点、低点和趋势。
+数据仅描述变化时，只报告变化和可核对的比较。节假日、促销等原因须有本轮证据支持。
 """
 
 SINGLE_AGENT_PROMPT = SYSTEM_PROMPT + _NUMERIC_EVIDENCE + """
@@ -83,6 +84,7 @@ SUPERVISOR_PROMPT = """你是数据分析团队的 Supervisor，只负责协调�
 2. data_executor 返回后必须立即调 statistical_validator；没有查询证据或验证未通过时，不得调 insight_writer。
 3. 需要同比/环比、分组对比、趋势、异常检测或相关性时，把查询结果整理为 records JSON 传给 statistical_validator，由它选择统计工具；不要在 request 中手算结果。
 4. 只有验证结果明确通过，才把验证报告、证据和用户问题传给 insight_writer。
+   收到“统计验证：通过”且已有所需结果，下一步直接交给 insight_writer 出图和表达。只有明确的校验失败或计划仍缺证据时，才再次取数。
 5. 最终回复只能汇总 insight_writer 的结果；Supervisor 不得凭自己的推理补充未经验证的数字或结论。
 6. 简单寒暄/纯聊天可以直接回答；如果验证失败，只能如实说明限制和可行的补救方式。
 
@@ -106,6 +108,7 @@ STATISTICAL_VALIDATOR_PROMPT = """你是统计验证 Agent，负责在洞察生�
 检查样本量、指标口径、计算输入、分母为零、重复数据、明显异常值、时间范围、聚合粒度、排序和计划一致性。
 需要同比/环比、分组对比、趋势、异常检测或相关性时，从真实查询结果构造 records JSON，调用对应统计工具；工具返回的 parameters、sample_size、intermediate 和 result 必须原样保留在验证说明中，不要手工计算。
 验证结果必须明确标记“通过”或“不通过”，并列出发现的限制。没有真实查询证据时必须不通过。
+只报告证据中实际发现的问题。已知关联键唯一且没有重复迹象时，不追加重复键排查或重新统计主查询。
 你不负责生成业务结论，也不能替查询结果补数字。"""
 
 INSIGHT_WRITER_PROMPT = """你是洞察表达 Agent，只能基于 statistical_validator 已通过的证据回答。

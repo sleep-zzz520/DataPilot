@@ -409,12 +409,28 @@ def make_agent(
     viz_tools = [by_name[n] for n in VIZ_TOOL_NAMES if n in by_name]
     statistical_tools = [by_name[n] for n in STAT_TOOL_NAMES if n in by_name]
 
+    def reuse_validated_result(_request: str) -> Optional[str]:
+        if (plan_runtime is None or plan_runtime.has_contracts
+                or plan_runtime.validation_status != "approved" or not plan_runtime.plan.result_columns):
+            return None
+        query_steps = [step for step in plan_runtime.plan.steps if step.kind == "query"]
+        if not query_steps or any(step.status != "succeeded" for step in query_steps):
+            return None
+        table, _ = plan_runtime.result_delivery()
+        if table is None:
+            return None
+        evidence = json.dumps({"columns": table["columns"], "rows": table["rows"]},
+                              ensure_ascii=False, default=str)
+        instruction = "主查询已完成并通过统计验证，请将已有结果传给 insight_writer 完成分析。"
+        return instruction + ("\n" + evidence if len(evidence) <= 4000 else "")
+
     role_tools: list = []
     if data_tools:
         role_tools.append(_make_role_tool(
             "data_executor",
             "负责 Schema、MySQL SELECT 和上传文件的真实查询，只返回可复核数据证据。",
             llm, data_tools, DATA_EXECUTOR_PROMPT, trace, plan_runtime,
+            before=reuse_validated_result,
             worker_timeout_seconds=worker_timeout_seconds,
             worker_semaphore=worker_semaphore,
             execution_budget=budget,

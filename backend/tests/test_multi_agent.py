@@ -100,6 +100,35 @@ def test_supervisor_routes_data_validate_then_insight():
     assert any("120" in m.content for m in msgs if m.type == "tool")
 
 
+def test_supervisor_reuses_approved_result_when_asked_to_query_again():
+    question = "列出前2行品类销售额并画柱状图"
+    runtime = PlanRuntime(AnalysisPlan(goal=question, metrics=["销售额"],
+                                       result_columns=["品类", "销售额"], steps=[
+        {"id": "q", "title": "查询销售额", "kind": "query"},
+    ]), question)
+    args = {"sql": "SELECT category, SUM(amount) FROM sales GROUP BY category ORDER BY SUM(amount) DESC LIMIT 2"}
+    runtime.before_tool("query_mysql", args)
+    runtime.after_tool("query_mysql", args,
+        '<!--TABLE:{"columns":["品类","销售额"],"rows":[["甲",15],["乙",12]]}-->')
+    assert runtime.validate_evidence()["status"] == "approved"
+    llm = FakeLLM(responses=[
+        _tool_call("data_executor", {"request": "重新排查并扫描数据"}, "q2"),
+        _tool_call("insight_writer", {"request": "绘制通过验证的两行结果"}, "viz"),
+        _tool_call("make_chart", {"chart_type": "bar", "title": "品类销售额", "x_labels": ["甲", "乙"],
+                                  "series": [{"name": "销售额", "data": [15, 12]}]}, "chart"),
+        AIMessage(content="已绘制柱状图"),
+        AIMessage(content="销售额最高的是甲。"),
+    ])
+    graph, _ = make_agent(llm, _all_tools(), plan_runtime=runtime, mode="multi")
+    result = graph.invoke({"messages": [HumanMessage(content=question)]})
+    outputs = {m.name: m.content for m in result["messages"] if m.type == "tool"}
+    assert "主查询已完成并通过统计验证" in outputs["data_executor"]
+    assert '[["甲", 15], ["乙", 12]]' in outputs["data_executor"]
+    assert "<!--CHART:" in outputs["insight_writer"]
+    assert runtime.validation_status == "approved"
+    assert len(runtime.plan.evidence) == 1
+
+
 def test_supervisor_routes_viz_expert():
     llm = FakeLLM(responses=[
         _tool_call("insight_writer", {"request": "画柱状图，数据 A:10 B:20"}, "c1"),
