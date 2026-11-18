@@ -762,6 +762,17 @@ class PlanRuntime:
             return ["执行已终止，结果不再接受"]
         step = self._current or self._step_for(tool, args)
         step_id = step.id if step else None
+        query_steps = [item for item in self.plan.steps if item.kind == "query"]
+        # Unbound follow-up queries can support validation only after every
+        # planned query has supplied clean, active evidence. Legacy plans and
+        # failed/incomplete primary queries retain the full result constraints.
+        supporting = (tool in self.QUERY_TOOLS and step is None and bool(query_steps)
+                      and not ((args or {}).get("plan_step_id") or (args or {}).get("step_id"))
+                      and all(item.status == "succeeded" and any(
+                          evidence.get("step_id") == item.id and evidence.get("active")
+                          and not evidence.get("quality_issues")
+                          and evidence.get("id") in self._payloads
+                          for evidence in self.plan.evidence) for item in query_steps))
         issues: list[str] = []
         failed = ("错误" in (result or "") or "异常" in (result or "")
                   or (result or "").startswith("[TOOL_TIMEOUT]"))
@@ -783,7 +794,7 @@ class PlanRuntime:
                 issues.append("查询缺少真实结构化结果")
             if (payload and not rows) or (not payload and "空结果" in (result or "")):
                 issues.append("查询返回空结果")
-            if len(rows) < 2 and any(word in self.question for word in ("对比", "趋势", "分布", "相关")):
+            if not supporting and len(rows) < 2 and any(word in self.question for word in ("对比", "趋势", "分布", "相关")):
                 issues.append("样本量不足，无法支持比较类结论")
             if payload and self.has_contracts:
                 actual_sql = payload.get("executed_sql")
@@ -823,10 +834,10 @@ class PlanRuntime:
                     issues.append("查询未体现计划中的过滤条件")
                 if self.plan.time_range and "where" not in sql.lower():
                     issues.append("查询未体现计划中的时间范围")
-                if (self.plan.grain and self.plan.dimensions and _has_aggregate_metric(self.plan.metrics)
+                if (not supporting and self.plan.grain and self.plan.dimensions and _has_aggregate_metric(self.plan.metrics)
                         and "group by" not in sql.lower()):
                     issues.append("查询未体现计划要求的聚合粒度")
-                if self.plan.sort and "order by" not in sql.lower():
+                if not supporting and self.plan.sort and "order by" not in sql.lower():
                     issues.append("查询未体现计划要求的排序")
             fingerprint = hashlib.sha256(json.dumps({"source": tool, "sql": sql,
                 "source_name": args.get("file") or args.get("database") or args.get("file_id"),
@@ -835,6 +846,7 @@ class PlanRuntime:
             evidence_id = "ev_" + fingerprint[:24]
             meta = {"id": evidence_id, "source": tool, "source_name": args.get("file") or args.get("database") or args.get("file_id"),
                     "sql": sql, "columns": columns, "row_count": len(rows), "step_id": step_id,
+                    "role": "supporting" if supporting else "result",
                     "version": self.plan.version, "fingerprint": fingerprint, "active": not failed and payload is not None,
                     "quality_issues": list(issues),
                     "executed_sql": payload.get("executed_sql") if payload else None,
@@ -876,7 +888,7 @@ class PlanRuntime:
         candidates = []
         largest = 0
         for evidence in reversed(self.plan.evidence):
-            if not evidence.get("active"):
+            if not evidence.get("active") or evidence.get("role") == "supporting":
                 continue
             payload = self._payloads.get(evidence.get("id"))
             if not payload:

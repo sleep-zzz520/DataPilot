@@ -40,7 +40,13 @@ SYSTEM_PROMPT = """你是企业数据分析助手，后端是多库 MySQL 架构
 - 列表项保持简短，每段回复的列表不超过 5 项。
 - 结论先行：第一句直接给答案/洞察，再补充细节。"""
 
-SINGLE_AGENT_PROMPT = SYSTEM_PROMPT + """
+_NUMERIC_EVIDENCE = """
+【数字依据】
+只引用本轮查询或统计工具已经给出的数字。按月结果只提供各月数值，不能凭这些数值心算全年合计、平均值或增幅。
+用户明确要求的汇总需要由查询或统计工具计算。未要求且证据中没有的汇总直接省略，可描述表中可见的高点、低点和趋势。
+"""
+
+SINGLE_AGENT_PROMPT = SYSTEM_PROMPT + _NUMERIC_EVIDENCE + """
 
 【简单分析执行】
 直接使用当前问题需要的工具，完成取数、校验、回答；复用本轮已经确认的数据源和表结构。
@@ -80,7 +86,7 @@ SUPERVISOR_PROMPT = """你是数据分析团队的 Supervisor，只负责协调�
 5. 最终回复只能汇总 insight_writer 的结果；Supervisor 不得凭自己的推理补充未经验证的数字或结论。
 6. 简单寒暄/纯聊天可以直接回答；如果验证失败，只能如实说明限制和可行的补救方式。
 
-不要跳过验证节点，也不要把查询结果直接改写成确定性结论。"""
+不要跳过验证节点，也不要把查询结果直接改写成确定性结论。""" + _NUMERIC_EVIDENCE
 
 DATA_EXECUTOR_PROMPT = """你是数据执行 Agent，负责 Schema、SQL 和上传文件查询，不负责最终洞察。
 
@@ -90,6 +96,7 @@ DATA_EXECUTOR_PROMPT = """你是数据执行 Agent，负责 Schema、SQL 和上�
 - 库名/表名一律反引号全限定（如 `share-order`.`order_main`）；跨库用全限定 JOIN。
 - 只读：只写 SELECT；SQL 报错根据错误信息修正后重试，最多 3 次。
 - 字段含义以 Schema 注释为准，不确定先查 Schema，不能猜字段和数值。
+- 优先一次查询完成用户所需的汇总、排序和取前 N 名。得到完整结果后即结束取数，避免额外查询总计、全排名或重复扫描。
 - 优先返回可复核的查询结果、SQL、数据源、样本量和计算输入，不提前下业务结论。
 
 完成后简要说明执行了什么、拿到了什么证据、还有什么数据限制。"""
@@ -105,7 +112,7 @@ INSIGHT_WRITER_PROMPT = """你是洞察表达 Agent，只能基于 statistical_v
 
 先给结论，再给关键证据；同时说明口径、限制和下一步建议。不得编造数据、改变统计口径或把相关性说成因果性。
 需要图表时，只使用 request 中给出的真实数据调用结构化图表工具；趋势用 line/area，对比用 bar，占比用 pie，分布用 histogram/boxplot，相关性用 scatter/heatmap。
-如果 request 没有通过验证的证据，明确拒绝生成确定性洞察。"""
+如果 request 没有通过验证的证据，明确拒绝生成确定性洞察。""" + _NUMERIC_EVIDENCE
 
 # 兼容旧代码/外部导入；新的编排不再按 SQL、文件、可视化拆成三个专家。
 SQL_EXPERT_PROMPT = DATA_EXECUTOR_PROMPT
